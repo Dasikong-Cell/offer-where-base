@@ -1,0 +1,403 @@
+/**
+ * BOSS 直聘 专用投递脚本
+ * 流程：检测登录态 →（未登录）邮箱验证码登录（验证码走 QQ 邮箱 IMAP 自动读取）→
+ *       打开岗位详情 → 立即沟通 / 投简历 → 发送招呼语 → 检测投递成功。
+ *
+ * 说明：BOSS 的投递本质是「发起沟通并发送简历」，且常有人机校验（滑块/短信）。
+ * 脚本状态驱动、可重复执行：登录态由持久化上下文保留，遇到滑块返回 need_captcha，
+ * 用户在打开的浏览器里人工过一下后再次调用即可继续。
+ */
+import { ApplyLogger, bexec, pageText, pageUrl, tryScreenshot, sleep, humanDelay, loginViaEmailCode, resolveResumePath } from './common.js';
+import type { ApplyInput, ApplyResult } from './types.js';
+import { detectRiskSignal, riskStatusOf } from '../riskSignals.js';
+import { buildJdExtractEval, parseSerializeResult, serializeToStructuredText } from '../domSerialize.js';
+import * as db from '../../db.js';
+
+const LOGIN_URL = 'https://www.zhipin.com/web/user/?ka=header-login';
+const HOME_URL = 'https://www.zhipin.com/';
+
+function needsLogin(url: string, text: string): boolean {
+  if (/web\/user|login\.zhipin|passport\.zhipin/.test(url)) return true;
+  return /(邮箱登录|短信登录|账号密码登录|扫码登录|验证码登录)/.test(text);
+}
+
+/**
+ * 从 BOSS 岗位详情页抓取 JD 文本（职位描述）。
+ * BOSS 搜索卡片不含 JD，只有进到 JD 页才有完整职位描述。
+ *
+ * ⚠️ 技术债 D1 修复：不再用 `document.body.innerText` 把整块正文压成一段（那样会丢失
+ * 「岗位职责 / 任职要求 / 福利」的分段结构，喂给 LLM 做匹配判定时模型只能靠语序猜）。
+ * 改用 `domSerialize.ts` 的结构化序列化：保留标签与关键 class，再 `serializeToStructuredText`
+ * 转成「小标题带 `##` 前缀、段落边界保留」的纯文本入库。多选择器兜底 + 整页兜底。
+ * 失败返回空串（调用方忽略即可，不影响投递）。
+ */
+async function extractBossJd(platform: string, logs: ApplyLogger): Promise<string> {
+  const sel = ['#job-description', '.job-description', '.job-detail .text', '.job-sec .text', '.job-detail', 'div[class*="job-description"]', 'div[class*="description"]', '.text'];
+  try {
+    // 首选：命中 JD 容器选择器 → 结构化序列化（保留分段）
+    let evalStr = buildJdExtractEval({ selectors: sel, maxLen: 6000 });
+    let r = await bexec(platform, 'eval', { script: evalStr }, logs, '提取 JD 结构化文本');
+    let p = parseSerializeResult(r.data);
+    if (!p.found || !p.html) {
+      // 兜底：整页结构化序列化（仍非裸 innerText，结构保留）
+      evalStr = buildJdExtractEval({ maxLen: 6000 });
+      r = await bexec(platform, 'eval', { script: evalStr }, logs, '兜底：整页结构化序列化');
+      p = parseSerializeResult(r.data);
+    }
+    if (!p.html) return '';
+    // serializeToStructuredText 已保留换行与 `##` 小标题，切勿再 flatten 空白（会丢结构）
+    const jd = serializeToStructuredText(p.html);
+    return jd.length > 6000 ? jd.slice(0, 6000) : jd;
+  } catch (e: any) {
+    logs.step('JD 补全', false, `抓取失败（忽略）：${e?.message}`);
+    return '';
+  }
+}
+
+export async function runBoss(input: ApplyInput): Promise<ApplyResult> {
+  const logs = new ApplyLogger();
+  const platform = 'boss';
+  const resumePath = resolveResumePath(input.profile.resume_path);
+  const jobUrl = input.jobUrl || input.job?.apply_url || undefined;
+  const company = input.job?.company ?? null;
+  const position = input.job?.position ?? null;
+
+  try {
+    // 1) 打开岗位详情页（若未给链接则先回首页）
+    if (jobUrl) {
+      await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '打开岗位详情');
+    } else {
+      await bexec(platform, 'navigate', { url: HOME_URL, waitUntil: 'domcontentloaded' }, logs, '打开 BOSS 首页');
+    }
+    await sleep(2000);
+
+    let text = await pageText(platform);
+    let url = jobUrl || HOME_URL;
+
+    // 2) 登录态检测
+    if (needsLogin(url, text)) {
+      logs.step('登录态', false, '未登录，执行邮箱验证码登录');
+      const r = await loginBoss(input, logs);
+      if (r.status === 'need_captcha') {
+        const shot = await tryScreenshot(platform);
+        return { platform, status: 'need_captcha', message: r.message, logs: logs.logs, company, position, screenshot: shot };
+      }
+      if (r.status === 'error') {
+        const shot = await tryScreenshot(platform);
+        return { platform, status: 'error', message: r.message, logs: logs.logs, company, position, screenshot: shot };
+      }
+      // 登录后回到岗位页
+      if (jobUrl) {
+        await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '登录后重新打开岗位');
+        await sleep(2000);
+      }
+    } else {
+      logs.step('登录态', true, '已登录');
+    }
+
+    // 2.5) 岗位已下线 / 关闭检测：BOSS 关闭的岗位页面不存在「继续沟通」按钮，
+    //      只在正文显示「职位已关闭 / 该职位已暂停」等字样。提前识别直接判 unavailable，
+    //      避免走「找不到按钮 → need_manual」被批量连投反复重试同一岗位。
+    //      （登录流程可能重新导航过页面，故此处重新读取最新文本/URL，确保判断基于岗位页本身）
+    if (jobUrl) {
+      const freshText = await pageText(platform);
+      const freshUrl = await pageUrl(platform);
+
+      // 2.5.0) 风控 / 额度信号优先：账号级处罚远比"少投一份"严重，
+      //        识别到就带**可执行处置**返回，并由批量投递中止整批（见 services/riskSignals.ts）。
+      const risk = detectRiskSignal(freshText);
+      if (risk) {
+        logs.step('风控检测', false, `${risk.kind}：命中「${risk.matched}」`);
+        const shot = await tryScreenshot(platform);
+        return {
+          platform, status: riskStatusOf(risk.kind),
+          message: `检测到平台风控信号「${risk.matched}」。${risk.action}`,
+          logs: logs.logs, company, position, screenshot: shot,
+        };
+      }
+
+      const closedMarkers = /(职位已关闭|该职位已关闭|职位已暂停|该职位已暂停|职位已下线|该职位已下线|该职位不存在|职位已招满|该职位已招满|该职位可能已)/;
+      if (closedMarkers.test(freshText + ' ' + freshUrl)) {
+        logs.step('岗位状态', false, `检测到岗位已下线/关闭，跳过投递：${(freshText || '').slice(0, 120)}`);
+        const shot = await tryScreenshot(platform);
+        return { platform, status: 'unavailable', message: '该岗位已下线/关闭，无法投递', logs: logs.logs, company, position, screenshot: shot };
+      }
+    }
+
+    // 2.6) 补全 JD 文本：岗位详情页读取职位描述入库，使后续 AI 匹配基于真实 JD
+    //      （而非仅靠职位名），匹配分更高更准。投递前抓取，不影响投递主流程。
+    if (jobUrl && input.job?.id) {
+      const jdText = await extractBossJd(platform, logs);
+      if (jdText && jdText.length >= 20) {
+        db.upsertJob({ id: input.job.id, jd: jdText, requirements: '' });
+        logs.step('JD 补全', true, `已抓取 JD（${jdText.length} 字）`);
+      }
+    }
+
+    // 3) 发起沟通 / 投递
+    if (jobUrl) {
+      // BOSS JD 页真实投递按钮文案实测为「继续沟通」，而不是常说的「立即沟通」。
+      // ⚠️ 千万不要把「在线简历」「完善在线简历」「感兴趣」放进候选列表：JD 页右侧常驻这些
+      //    辅助入口，点了只会跳到简历编辑页 / 标记感兴趣，不会发起沟通。
+      //    实测教训：候选里有「在线简历」→ 点中后跳 https://www.zhipin.com/web/geek/resume，
+      //    脚本误以为已进入引导页并在那里上传简历，最终报 need_manual、一个都没投出去。
+      const labels = ['继续沟通', '立即沟通', '沟一下', '沟通', '投个简历', '发简历', '投递简历', '投递'];
+
+      // ── 预览模式（dry-run）：走完导航 → 下线检测 → JD 抓取之后，**只探测投递入口是否可用，绝不点击**。
+      //    平台通道的"投递"就是点一下按钮，没有可拦截的提交步骤，所以必须在点击前返回
+      //    （参考同类开源项目 boss_batch_push 的 mock 模式）。
+      //    价值：用户可在**零真实投递**的前提下验证「登录态 / 选择器 / 岗位是否可投」整条链路。
+      if (input.preview === true) {
+        const probe = await bexec(platform, 'eval', {
+          script: `(function(){var T=${JSON.stringify(labels)};var hit=[];
+            var els=document.querySelectorAll('a,button,span,div,i');
+            for(var i=0;i<els.length;i++){var e=els[i];var s=(e.innerText||'').trim();
+              if(s&&T.indexOf(s)>=0&&e.offsetHeight>0&&hit.indexOf(s)<0)hit.push(s);}
+            return JSON.stringify({hit:hit,title:document.title});})()`,
+        }, logs, '预览：探测投递入口（不点击）');
+        let hit: string[] = [];
+        try { hit = JSON.parse(String(probe.data || '{}')).hit || []; } catch { /* 探测失败不影响结论 */ }
+        const shot = await tryScreenshot(platform);
+        logs.step('预览', hit.length > 0, hit.length ? `可投递入口：${hit.join(' / ')}` : '未探测到投递入口');
+        return {
+          platform,
+          status: 'preview',
+          company,
+          position,
+          screenshot: shot,
+          logs: logs.logs,
+          message: hit.length
+            ? `预览：岗位页正常，投递入口「${hit.join(' / ')}」可用；本次未点击，未产生任何真实投递`
+            : '预览：岗位页正常，但未探测到投递入口按钮（正式投递时很可能需要人工介入）',
+        };
+      }
+
+      // 立即沟通（BOSS 投递入口）
+      let chatted = false;
+      for (const label of labels) {
+        const rr = await bexec(platform, 'click', { text: label, timeout: 10000 }, logs, `点击「${label}」`);
+        if (rr.ok) { chatted = true; break; }
+      }
+      if (!chatted) {
+        const shot = await tryScreenshot(platform);
+        const page = await pageText(platform);
+        const url = await pageUrl(platform);
+        const html = await bexec(platform, 'html', { maxLength: 4000 }, logs, '抓取页面HTML片段');
+        logs.step('诊断', false, `url=${url}; 页面文本前500字=${page.slice(0, 500)}; html片段=${(html.html || '').slice(0, 500)}`);
+        // 按钮找不到很可能是**风控把页面换掉了**（额度到顶/账号异常）——先把这类判出来，
+        // 否则会被笼统归成 need_manual，用户反复重试反而加重处罚。
+        const risk = detectRiskSignal(`${page} ${url}`);
+        if (risk) {
+          logs.step('风控检测', false, `点击失败且命中风控信号：${risk.kind}「${risk.matched}」`);
+          return {
+            platform, status: riskStatusOf(risk.kind),
+            message: `点击投递失败并检测到平台风控信号「${risk.matched}」。${risk.action}`,
+            logs: logs.logs, company, position, screenshot: shot,
+          };
+        }
+        return { platform, status: 'need_manual', message: '未找到「立即沟通/投简历」按钮，可能页面结构变化或需先完善在线简历', logs: logs.logs, company, position, screenshot: shot };
+      }
+      await humanDelay(2500);
+
+      // 3.4) 二次确认弹窗：若与该 Boss 此前已沟通过，点「继续沟通」后 BOSS 会弹
+      //      「温馨提示：是否就新职位<岗位名>继续沟通？取消 / 沟通新职位」。
+      //      必须点「沟通新职位」才算就本岗位建立沟通，否则停在弹窗上，什么都没发生。
+      //      （原生 JS 对话框由 cdpDriver 统一自动确认；此处专门处理这种 React 弹窗）
+      if (await dismissBossSwitchJobModal(platform, logs)) {
+        logs.step('更换沟通职位', true, '该 Boss 此前已沟通过，已确认就本岗位继续沟通');
+        await humanDelay(2000);
+      }
+
+      // 3.5) 点击后检测页面状态：可能进入聊天，也可能被引导到「完善在线简历 / 开通 VIP」页
+      const postClickUrl = await pageUrl(platform);
+      const postClickText = await pageText(platform);
+      // ⚠️ 不能用「完善简历/在线简历」字样判断被引导：JD 页右侧本来就常驻「完善在线简历」
+      //    按钮，正文里天然含这些词，留在正则里会导致「明明已进聊天却误判成引导页」。
+      //    真正被引导的标志只有 URL（简历编辑页 / linkFrom=boss）和明确的 VIP 付费墙字样。
+      const guidedToResume = /cv\.zhipin\.com\/edit-resume|geek\/resume|linkFrom=boss|开通会员|尊享会员|升级VIP|求职VIP|先完善/.test(postClickUrl + ' ' + postClickText.slice(0, 300));
+      const inChat = /web\/im|chat\.zhipin|web\/geek\/chat|\.chat-conversation|聊天/.test(postClickUrl + ' ' + postClickText.slice(0, 300));
+
+      // 情况 A：进入「完善在线简历 / VIP」引导页（未进入聊天）—— 直接尝试发送附件简历，不走完善在线简历
+      if (guidedToResume && !inChat) {
+        logs.step('投递引导', false, `点击后进入简历完善/VIP 引导页：${postClickUrl}，尝试直接发送附件简历`);
+        const sent = await uploadResumeAttachment(platform, resumePath, logs);
+        await humanDelay(2500);
+        const afterText = await pageText(platform);
+        const afterUrl = await pageUrl(platform);
+        const shot = await tryScreenshot(platform);
+        if (sent && (/(已发送|发送成功|简历已送达|沟通中|投递成功|附件已|已发送给您)/.test(afterText) || /web\/im|chat/.test(afterUrl))) {
+          return { platform, status: 'applied', message: `已在引导页通过附件简历向「${company || position || '该岗位'}」发起沟通`, logs: logs.logs, company, position, screenshot: shot };
+        }
+        if (sent) {
+          return { platform, status: 'need_manual', message: '已在引导页上传附件简历，但未能确认沟通是否建立，请在调试 Chrome 中确认是否成功发送', logs: logs.logs, company, position, screenshot: shot };
+        }
+        return { platform, status: 'need_manual', message: 'BOSS 要求先完善在线简历或开通 VIP 才能投递。可在调试 Chrome 内点「上传附件简历」手动发送，或完善在线简历后再试', logs: logs.logs, company, position, screenshot: shot };
+      }
+
+      // 情况 B：已进入聊天（或岗位页可直接沟通）—— 发送招呼语 + 附件简历
+      const greeting = `您好，我对「${position || '该岗位'}」很感兴趣，这是我的简历，期待进一步沟通。`;
+
+      // 检测是否已真正进入聊天：URL 跳到聊天页 或 页面出现聊天输入框/会话列表（同页浮层也算）。
+      // ⚠️ 必须「轮询等待」而不是一次性判断：BOSS 是 SPA，点「继续沟通」后跳聊天页需要时间，
+      //    一次性判断偶尔会在跳转完成前就返回 false，导致明明投递成功却误报 need_manual
+      //    （实测同一岗位重跑即 applied）。waitMs>0 时最多轮询该时长。
+      const chatOpen = async (waitMs = 0): Promise<boolean> => {
+        const deadline = Date.now() + waitMs;
+        for (;;) {
+          const urlNow = await pageUrl(platform);
+          if (/web\/im|geek\/chat|chat\.|im\//.test(urlNow)) return true;
+          const r = await bexec(platform, 'eval', {
+            script: "!!document.querySelector('.chat-input') || !!document.querySelector('div[contenteditable=true]') || !!document.querySelector('.chat-conversation') || !!document.querySelector('.chat-user')",
+          }, undefined, '检测聊天框');
+          if (r.data) return true;
+          if (Date.now() >= deadline) return false;
+          await sleep(1000);
+        }
+      };
+
+      // 首轮「继续沟通」点击可能未被页面接收（页面未就绪 / 首点被吞），
+      // 这里确认聊天是否真正打开，未打开则补点一次「继续沟通 + 沟通新职位」。
+      let opened = await chatOpen(6000);
+      if (!opened) {
+        for (const label of labels) {
+          const rr = await bexec(platform, 'click', { text: label, timeout: 8000 }, logs, `补点「${label}」`);
+          if (rr.ok) break;
+        }
+        await humanDelay(2500);
+        if (await dismissBossSwitchJobModal(platform, logs)) {
+          logs.step('更换沟通职位', true, '补点后确认就本岗位继续沟通');
+          await humanDelay(2000);
+        }
+        opened = await chatOpen(6000);
+      }
+      if (!opened) {
+        const shot = await tryScreenshot(platform);
+        const page = await pageText(platform);
+        logs.step('诊断', false, `点击沟通后仍未进入聊天：${page.slice(0, 300)}`);
+        return { platform, status: 'need_manual', message: '点击「继续沟通」后未能进入聊天，可能页面结构变化或需人工过验证', logs: logs.logs, company, position, screenshot: shot };
+      }
+
+      // 在聊天框发送招呼语（BOSS 需主动发消息才会建立沟通）。
+      // 注意：.chat-input 是包着 contenteditable 的容器 div，直接 fill 无效，
+      // 必须优先填内部的 contenteditable 节点，否则招呼语写不进去。
+      for (const sel of ['div[contenteditable="true"]', '.chat-input [contenteditable]', '.chat-input', '#chat-input', 'textarea[placeholder*="沟通"]']) {
+        const fr = await bexec(platform, 'fill', { selector: sel, value: greeting, timeout: 5000 }, logs, '填写招呼语');
+        if (fr.ok) break;
+      }
+      for (const sel of ['发送', 'button:has-text("发送")', '.send-btn']) {
+        const sr = await bexec(platform, 'click', { text: '发送', timeout: 5000 }, logs, '发送招呼语');
+        if (sr.ok) break;
+      }
+
+      // 上传附件简历（固定使用默认简历 PDF，无需完善在线简历）
+      await uploadResumeAttachment(platform, resumePath, logs);
+      await humanDelay(2000);
+
+      text = await pageText(platform);
+      const finalUrl = await pageUrl(platform);
+      const shot = await tryScreenshot(platform);
+      logs.step('最终URL', true, finalUrl);
+      // 「继续沟通」成功会跳进聊天页或弹出同页聊天浮层；仍停在 JD 页且无聊天框说明沟通未建立。
+      // ⚠️ 不能只用 /沟通/.test(text) 判定成功：JD 页正文天然含「继续沟通」按钮文案，
+      //    那样会让「点了按钮但没有任何效果」也被误报成 applied。
+      const enteredChat = await chatOpen();
+      const ok = enteredChat || /(已发送|发送成功|简历已送达|沟通中|附件已|已发送给您)/.test(text);
+      if (ok) {
+        return { platform, status: 'applied', message: `已在 BOSS 向「${company || position || '该岗位'}」发起沟通并发送附件简历`, logs: logs.logs, company, position, screenshot: shot };
+      }
+      return { platform, status: 'need_manual', message: '已点击沟通并发送附件简历，但未能确认投递成功，请检查打开的浏览器', logs: logs.logs, company, position, screenshot: shot };
+    }
+
+    // 未给岗位链接：仅完成登录即返回，等待用户补充岗位
+    const shot = await tryScreenshot(platform);
+    return { platform, status: 'need_login', message: '已登录；请提供岗位详情链接以继续投递', logs: logs.logs, company, position, screenshot: shot };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, company, position, screenshot: shot };
+  }
+}
+
+/**
+ * 关闭 BOSS「二次确认」弹窗：与某 Boss 此前已沟通过时点「继续沟通」会弹出
+ * 「温馨提示：是否就新职位<岗位名>继续沟通？取消 / 沟通新职位」。
+ * 必须点「沟通新职位」才就本岗位建立沟通，否则停在弹窗上、什么都没发生。
+ * 该弹窗出现时机不稳定（偶发延迟 1~3s），且按钮文案可能带细微差异，
+ * 故先等弹窗渲染、再用多候选文案各试一次，命中即确认并返回 true。
+ * （注意：原生 JS 对话框不归此函数管，由 cdpDriver 统一自动确认。）
+ */
+async function dismissBossSwitchJobModal(platform: string, logs: ApplyLogger): Promise<boolean> {
+  const labels = ['沟通新职位', '沟通新岗位', '确认沟通新职位', '就新职位沟通'];
+  await sleep(1500); // 等弹窗渲染
+  for (const label of labels) {
+    // 探测性点击：多数岗位不会弹该窗口，失败属正常，故不写日志（否则每次投递都会
+    // 刷出 4 行「未找到可点击元素」的 FAIL，看着像出错、也淹没真正的失败步骤）。
+    const r = await bexec(platform, 'click', { text: label, timeout: 800 }, undefined, undefined);
+    if (r.ok) {
+      logs.step('二次确认弹窗', true, `已点「${label}」确认就本岗位沟通`);
+      await sleep(1500);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 上传附件简历（PDF）。BOSS 聊天页 / 简历完善页均有「上传附件简历」入口，
+ * 对应隐藏 file input 为 input[ka=user-resume-upload-file]（accept 含 pdf）。
+ * 优先直接对 file input 写入文件；若 file input 尚未出现，则先点按钮唤起再上传。
+ */
+async function uploadResumeAttachment(platform: string, resumePath: string | undefined, logs: ApplyLogger): Promise<boolean> {
+  if (!resumePath) {
+    logs.step('简历附件', false, '未配置简历路径，跳过附件上传');
+    return false;
+  }
+  const selectors = [
+    'input[ka=user-resume-upload-file]',
+    'input[accept*="pdf"]',
+    'input[type=file]',
+    '.resume-upload input',
+  ];
+  // 1) 先尝试直接对 file input 写文件（最精准，不依赖先点按钮）
+  for (const sel of selectors) {
+    const ur = await bexec(platform, 'upload', { selector: sel, filePath: resumePath, timeout: 8000 }, logs, '上传简历附件');
+    if (ur.ok) {
+      logs.step('简历附件', true, `已上传附件简历：${resumePath}`);
+      return true;
+    }
+  }
+  // 2) file input 未出现：先点「上传附件简历」按钮唤起，再上传
+  for (const label of ['上传附件简历', '发送附件简历', '上传简历', '附件简历']) {
+    const cr = await bexec(platform, 'click', { text: label, timeout: 4000 }, logs, `点击「${label}」`);
+    if (cr.ok) break;
+  }
+  await sleep(1500);
+  for (const sel of selectors) {
+    const ur = await bexec(platform, 'upload', { selector: sel, filePath: resumePath, timeout: 10000 }, logs, '上传简历附件');
+    if (ur.ok) {
+      logs.step('简历附件', true, `已上传附件简历：${resumePath}`);
+      return true;
+    }
+  }
+  logs.step('简历附件', false, '未找到上传附件简历入口');
+  return false;
+}
+
+/** BOSS 邮箱验证码登录 */
+async function loginBoss(input: ApplyInput, logs: ApplyLogger) {
+  const profile = input.profile;
+  return loginViaEmailCode('boss', {
+    loginUrl: LOGIN_URL,
+    logs,
+    profile,
+    sinceMinutes: input.sinceMinutes || 10,
+    subjectKeyword: 'BOSS',
+    selectors: {
+      emailTab: ['邮箱登录'],
+      emailInput: ['#email', 'input[placeholder*="邮箱"]', 'input[name="email"]'],
+      sendCodeBtn: ['获取验证码', '发送验证码'],
+      codeInput: ['#code', 'input[placeholder*="验证码"]', 'input[name="code"]'],
+      submitBtn: ['登录', '立即登录', '确认'],
+      sliderHint: ['请拖动', '滑动验证', '拖动滑块'],
+    },
+  });
+}

@@ -1,0 +1,779 @@
+/**
+ * 统一「官网一键投递」引擎 —— 覆盖全量投递投递功能
+ *   hello   : 单岗位一键投递（打开 JD → 点 立即投递/立即沟通/聊一聊 → 确认）
+ *   auto    : 按关键词(或默认列表)批量自动翻页投递
+ *   keyword : 同 auto，但强制使用关键词搜索
+ *   search  : 仅搜索收集岗位链接（不过滤、不投递），返回 foundJobs
+ *   again   : 对 HR 会话复聊（发送回复）
+ *   letter  : 打开岗位 → 发起沟通 → 发送求职信/招呼语
+ *
+ * 核心原则（对齐同类产品）：一键完成，依赖账号已填好的在线简历，不碰表单/级联；
+ * 用户选择「直接投不过滤」，故不做 AI 匹配门槛，凡是能点到的都一键投。
+ */
+import { ApplyLogger, bexec, pageText, tryScreenshot, sleep, loginViaEmailCode, probeApplyEntry, DEFAULT_APPLY_ENTRY_LABELS } from './common.js';
+import { getPlatform, type PlatformCfg, type PlatformKey } from './platforms.js';
+import { markLetterSent } from './letterLedger.js';
+// 🔴 composeCoverLetter 属核心（内含 LLM 提示词）—— 调用点用 composeOrUnavailable() 兜底
+import { composeCoverLetter } from './coverLetter.js';
+import { isCoreUnavailable, coreOrAsync, CORE_REQUIRED_MESSAGE } from '../../coreBridge.js';
+import { runExchangeActions } from './exchangeContact.js';
+import { sendChatResume } from './chatResumeImage.js';
+import { runJob51List } from './job51.js';
+import type { ApplyInput, ApplyResult, ApplyPlatform } from './types.js';
+import * as db from '../../db.js';
+// parsePositions 属基础侧（纯字段解析）—— 从核心模块导入会让基础版投递在解析目标职位时抛错
+import { parsePositions } from '../resumeBlob.js';
+
+/**
+ * 该能力属核心版、当前跑的是基础版时的统一返回。
+ * 🔴 **必须就地兜底，不能让异常逃逸**：本文件的外层 catch 会把 `e.message` 原样回给用户，
+ *   而桩抛出的 message 是 `CORE_UNAVAILABLE: <内部文件路径>` —— 既误导又泄露内部结构。
+ *   用 `need_manual` 而不是 `error`：没有真的尝试过投递，也不是脚本出错，
+ *   而是「这一步需要人工 / 完整版」。`/api/apply` 本身是**基础版路由**，不能回 501。
+ */
+function coreMissing(platform: ApplyPlatform, what: string, company: string | null = null, position: string | null = null): ApplyResult {
+  return {
+    platform,
+    status: 'need_manual',
+    message: `${CORE_REQUIRED_MESSAGE}：${what}。`,
+    logs: [],
+    company,
+    position,
+  };
+}
+
+/**
+ * 求职信生成（核心能力）的安全调用：核心缺席时返回 `null`，由调用方给出可读结论。
+ */
+async function composeOrUnavailable(
+  input: Parameters<typeof composeCoverLetter>[0],
+): Promise<Awaited<ReturnType<typeof composeCoverLetter>> | null> {
+  try {
+    return await composeCoverLetter(input);
+  } catch (err) {
+    if (isCoreUnavailable(err)) return null;
+    throw err;
+  }
+}
+async function currentUrl(platform: string): Promise<string> {
+  const r = await bexec(platform, 'eval', { script: 'location.href' });
+  return (r.data as string) || '';
+}
+
+function unsupported(platform: string): ApplyResult {
+  return {
+    platform: platform as ApplyPlatform,
+    status: 'error',
+    message: `不支持的平台：${platform}`,
+    logs: [],
+  };
+}
+
+/**
+ * 判断当前 URL 是否仍是该平台的「岗位详情页」。
+ * 链接失效时站点会重定向到活动页/外部合作页（实测：猎聘旧版 /job/xxx.shtml
+ * 会跳到 wow.liepin.com 活动页），此时页面上根本没有投递按钮，
+ * 继续跑只会误报「已点击但未确认」。提前识别直接判 unavailable。
+ */
+function isJobPage(platform: string, url: string): boolean {
+  if (!url) return true; // 取不到 URL 时不误判
+  try {
+    const u = new URL(url);
+    const h = u.hostname;
+    const p = u.pathname || '';
+    switch (platform) {
+      case 'liepin':
+        return /liepin\.com$/.test(h) && /^\/(job|lptjob)\//.test(p);
+      case 'job51':
+        return /51job\.com$/.test(h);
+      case 'zhilian':
+        return /zhaopin\.com$/.test(h) && /\/jobdetail\//.test(p);
+      case 'boss':
+        return /zhipin\.com$/.test(h);
+      default:
+        return true;
+    }
+  } catch {
+    return true;
+  }
+}
+
+/** 检测/处理登录态；已登录返回 true，未登录尝试邮箱验证码登录；失败返回 false */
+export async function ensureLoggedIn(
+  platform: string,
+  cfg: PlatformCfg,
+  input: ApplyInput,
+  logs: ApplyLogger,
+): Promise<boolean> {
+  let text = await pageText(platform);
+  let url = await currentUrl(platform);
+  if (cfg.loginCheck(text, url)) {
+    // SPA 页面可能尚未渲染完，正文为空/残缺会把「已登录」误判成「未登录」，
+    // 进而白白走一趟验证码登录流程（实测 51job 因此全程报「未找到发送验证码按钮」）。
+    // 这里等 3 秒重取一次再判，避免误判。
+    await sleep(3000);
+    text = await pageText(platform);
+    url = await currentUrl(platform);
+  }
+  if (!cfg.loginCheck(text, url)) {
+    logs.step('登录态', true, '已登录');
+    return true;
+  }
+  logs.step('登录态', false, `未登录，尝试邮箱验证码登录（判定依据文本片段：${(text || '').slice(0, 120)}）`);
+  if (!cfg.login) {
+    return false;
+  }
+  const r = await loginViaEmailCode(platform, {
+    loginUrl: cfg.login.loginUrl,
+    logs,
+    profile: input.profile,
+    sinceMinutes: input.sinceMinutes || 10,
+    subjectKeyword: cfg.login.subjectKeyword,
+    selectors: cfg.login,
+  });
+  if (r.status === 'logged_in') {
+    logs.step('登录', true, '邮箱验证码登录成功');
+    await sleep(1500);
+    return true;
+  }
+  if (r.status === 'need_captcha') {
+    logs.step('登录', false, '出现滑块验证，请在打开的浏览器中人工完成后重试');
+    return false;
+  }
+  return false;
+}
+
+type OneClickResult = { applied: boolean; needResume: boolean };
+
+/** 在 JD 页点击投递/沟通按钮并确认 */
+async function oneClickApply(platform: string, cfg: PlatformCfg, logs: ApplyLogger): Promise<OneClickResult> {
+  let r: any = { ok: false, data: null };
+  try {
+    r = await bexec(platform, 'eval', { script: cfg.applyScript }, logs, `点击「${cfg.chatBased ? '沟通' : '投递'}」按钮`);
+  } catch (e: any) {
+    logs.step('点击按钮异常', false, e?.message || String(e));
+  }
+  await sleep(2500);
+  // 非沟通型平台常弹出「选择简历 / 确认投递」弹窗，补点确认
+  if (!cfg.chatBased) {
+    // 先关掉可能出现的「我知道了 / 去完善 / 稍后再说」提示遮罩，避免挡住确认按钮
+    for (const hint of ['我知道了', '去完善', '稍后再说', '关闭']) {
+      await bexec(platform, 'click', { text: hint, timeout: 1500 });
+    }
+    await sleep(800);
+
+    if (platform === 'job51') {
+      // 校招/校园岗位需要单独的校招简历，账号仅有普通简历，点击「立即投递」通常无反应或跳简历中心；
+      // 提前识别并跳过。注意：页面导航栏常驻「校园招聘」链接，必须用岗位标题(document.title)判断是否校招，
+      // 不能用正文，否则会误杀普通岗位。
+      const titleRes = await bexec(platform, 'eval', { script: 'document.title' });
+      if (/校招|校园招聘/i.test(String(titleRes.data || ''))) {
+        logs.step('岗位类型', false, '校招/校园岗位，账号无对应简历，跳过');
+        return { applied: false, needResume: false };
+      }
+      // 51job 投递弹窗存在两种形态，统一用「先确认→选简历→再确认」顺序覆盖两者：
+      //  A) 请选择需要投递的简历 →「立即申请」→ 选择附件简历 →「发送」
+      //  B) 选择简历 → 选「附件简历/我的简历」→「确定/投递」
+      // 先点「立即申请」开附件对话框（A 用；B 无此按钮则自动忽略，click 找不到返回 false 不中断），
+      // 再选简历/附件，最后依次点「发送/确定/投递/提交申请」（缺的自动忽略）。
+      await sleep(1500);
+      await bexec(platform, 'click', { text: '立即申请', timeout: 6000 }, logs, '确认在线简历');
+      await sleep(1000);
+      for (const sel of ['resume_source', '附件简历', '我的简历', '上传的简历']) {
+        await bexec(platform, 'click', { text: sel, timeout: 4000 }, logs, `选择简历「${sel}」`);
+      }
+      await sleep(800);
+      for (const c of ['发送', '确定', '投递', '提交申请']) {
+        await bexec(platform, 'click', { text: c, timeout: 4000 }, logs, `确认「${c}」`);
+      }
+      await sleep(2000);
+
+      // 流程走完后，再判定是否真的被引导到简历中心（账号缺在线简历）
+      const afterUrl = await currentUrl(platform);
+      const afterText = await pageText(platform);
+      const confirmed = new RegExp(cfg.confirmRegex).test(afterText);
+      if (!confirmed && /(resume\/center|resumeid|\/resume)/.test(afterUrl)) {
+        logs.step('简历校验', false, '账号缺少可用在线简历，已被引导至简历中心');
+        return { applied: false, needResume: true };
+      }
+    } else {
+      // 先关掉可能出现的「我知道了 / 去完善 / 稍后再说」提示遮罩，避免挡住确认按钮
+      for (const hint of ['我知道了', '去完善', '稍后再说', '关闭']) {
+        await bexec(platform, 'click', { text: hint, timeout: 1500 });
+      }
+      await sleep(800);
+      // 以「立即申请」为首选确认（智联/其它平台的简历选择对话框），其余为兜底
+      for (const lbl of ['立即申请', '确定', '提交申请', '保存并投递', '保存']) {
+        await bexec(platform, 'click', { text: lbl, timeout: 2500 }, logs, `确认弹窗「${lbl}」`);
+      }
+      await sleep(2000);
+
+      // 非 job51 平台：点「投递」若被重定向到简历中心，需人工先建简历
+      const afterUrl = await currentUrl(platform);
+      const afterText = await pageText(platform);
+      const resumeWall =
+        /(resume\/center|resumeid|\/resume)/.test(afterUrl) ||
+        /请先创建在线简历|您还没有在线简历|完善在线简历|简历完整度不足|请先完善简历/.test(afterText);
+      if (resumeWall) {
+        logs.step('简历校验', false, '账号缺少可用在线简历，已被引导至简历中心');
+        return { applied: false, needResume: true };
+      }
+    }
+  }
+  const text = await pageText(platform).catch(() => '');
+  const clicked = r && r.data === true;
+  const confirmed = new RegExp(cfg.confirmRegex).test(text);
+  if (cfg.chatBased) {
+    // 沟通型（BOSS/猎聘）：发起沟通即视为成功，页面无「投递成功」文案
+    logs.step('投递结果', clicked, clicked ? '已发起沟通' : '未成功发起沟通');
+    return { applied: clicked, needResume: false };
+  }
+  // 非沟通型（智联/51job）：以页面出现「投递成功/已投递」文案为准，避免误报
+  logs.step('投递结果', confirmed, confirmed ? '页面显示投递成功' : (clicked ? '已点击但页面未确认，请人工核对' : '未命中投递按钮'));
+  return { applied: confirmed, needResume: false };
+}
+
+/** 单岗位一键投递 */
+async function runOneClick(input: ApplyInput): Promise<ApplyResult> {
+  const platform = input.platform;
+  const cfg = getPlatform(platform);
+  if (!cfg) return unsupported(platform);
+  const logs = new ApplyLogger();
+  const jobUrl = input.jobUrl || input.job?.apply_url;
+  const company = input.job?.company ?? null;
+  const position = input.job?.position ?? null;
+
+  try {
+    if (jobUrl) {
+      await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '打开岗位详情');
+    } else {
+      await bexec(platform, 'navigate', { url: cfg.homeUrl, waitUntil: 'domcontentloaded' }, logs, '打开首页');
+    }
+    await sleep(2000);
+
+    const logged = await ensureLoggedIn(platform, cfg, input, logs);
+    if (!logged) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_login', message: '未登录，请在打开的浏览器中登录后重试', logs: logs.logs, company, position, screenshot: shot };
+    }
+    if (!jobUrl) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_manual', message: '已登录；请提供岗位详情链接（jobUrl）以继续一键投递', logs: logs.logs, company, position, screenshot: shot };
+    }
+
+    // 登录后重新打开岗位，确保投递态正确
+    await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '登录后重新打开岗位');
+    await sleep(2500);
+
+    // 岗位失效检测：链接可能已重定向到活动页/外部合作页（如猎聘跳 wow.liepin.com），
+    // 这类页面没有投递按钮，继续跑只会误报「已点击但未确认」。
+    const landed = await currentUrl(platform).catch(() => '');
+    if (landed && !isJobPage(platform, landed)) {
+      const shot = await tryScreenshot(platform).catch(() => undefined);
+      let host = landed;
+      try { host = new URL(landed).hostname; } catch { /* ignore */ }
+      logs.step('岗位失效', false, `链接已重定向到 ${landed}`);
+      // 2026-09-13 精准提示：跳转成因分三类，给出不同排查方向，避免误导。
+      let redirectHint: string;
+      if (/safe\.liepin\.com/.test(host)) {
+        redirectHint = '（猎聘安全验证中转 safe.liepin.com/verifysms：当前账号会话被要求真人短信验证，自动化无法绕过；请在猎聘调试窗口(9224)完成短信验证后重跑本批次）';
+      } else if (/wow\.liepin\.com/.test(host)) {
+        redirectHint = '（猎聘中转活动页 wow.liepin.com；未登录时也会被拦，请先确认登录态）';
+      } else {
+        redirectHint = '（注意：未登录时也会被拦到这类中转页，请先确认该平台在调试窗口已登录）';
+      }
+      return {
+        platform, status: 'unavailable', logs: logs.logs, company, position, screenshot: shot,
+        message: `岗位链接重定向到「${host}」，页面没有投递入口，无法自动投递${redirectHint}`,
+      };
+    }
+
+    const oc = await oneClickApply(platform, cfg, logs);
+    const shot = await tryScreenshot(platform);
+    if (oc.applied) {
+      return { platform, status: 'applied', message: `已在${cfg.label}向「${company || position || '该岗位'}」完成投递`, logs: logs.logs, company, position, screenshot: shot };
+    }
+    if (oc.needResume) {
+      return { platform, status: 'need_resume', message: `前程无忧账号缺少可用在线简历，已被引导至简历中心。请先在 51job「简历中心 → 在线简历」创建/完善一份在线简历并设为默认，再重试。`, logs: logs.logs, company, position, screenshot: shot };
+    }
+    return { platform, status: 'need_manual', message: '已点击但未能确认成功，请检查打开的浏览器（可能需补填必填项或遇滑块）', logs: logs.logs, company, position, screenshot: shot };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, company, position, screenshot: shot };
+  }
+}
+
+/** 批量/搜索：收集当前页岗位并逐个一键投递 */
+async function batchApply(input: ApplyInput, keyword: string, logs: ApplyLogger): Promise<ApplyResult> {
+  const platform = input.platform;
+  const cfg = getPlatform(platform);
+  if (!cfg) return unsupported(platform);
+  const maxPages = input.maxPages || 5;
+  const maxApply = input.maxApply && input.maxApply > 0 ? input.maxApply : 9999;
+  let applied = 0;
+  let skipped = 0;
+  let needResume = false;
+
+  try {
+    // 51job 首选「列表页直投」：直接 goto JD 详情页会触发阿里云滑块风控，
+    // 而搜索列表每行自带「投递」按钮，行内弹窗选简历→发送即可，不跳 JD 页。
+    if (platform === 'job51') {
+      const r51 = await runJob51List(input, keyword, maxApply);
+      (r51.logs || []).forEach(l => logs.logs.push(l));
+      return r51;
+    }
+
+    await bexec(platform, 'navigate', { url: cfg.searchUrl(keyword), waitUntil: 'domcontentloaded' }, logs, keyword ? `搜索「${keyword}」` : '打开职位列表');
+    await sleep(3500);
+
+    const logged = await ensureLoggedIn(platform, cfg, input, logs);
+    if (!logged) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_login', message: '未登录，请在打开的浏览器中登录后重试', logs: logs.logs, screenshot: shot };
+    }
+
+    for (let p = 0; p < maxPages; p++) {
+      const listRes = await bexec(platform, 'eval', { script: cfg.collectListScript || cfg.collectLinksScript }, logs, `第${p + 1}页收集入口`);
+      const listLinks: string[] = Array.isArray(listRes.data) ? listRes.data : [];
+      logs.step(`第${p + 1}页`, true, `收集到 ${listLinks.length} 个入口`);
+      if (!listLinks.length) break;
+
+      // 智联等配了 collectListScript：entry 是公司/聚合页，需再进一层收岗位（两级采集）；
+      // 其余平台：entry 直接就是 JD 链接，直接打开投递，不再二次导航收集。
+      const twoLevel = !!cfg.collectListScript;
+
+      for (const entry of listLinks) {
+        if (applied + skipped >= maxApply) break;
+        let targets: string[] = [entry];
+
+        if (twoLevel) {
+          await bexec(platform, 'navigate', { url: entry, waitUntil: 'domcontentloaded' }, logs, '打开公司页');
+          await sleep(3000);
+          const jobRes = await bexec(platform, 'eval', { script: cfg.collectLinksScript }, logs, '收集岗位链接');
+          const jobs: string[] = Array.isArray(jobRes.data) ? jobRes.data : [];
+          targets = jobs.length ? jobs : [entry];
+          logs.step('岗位', true, `本入口 ${targets.length} 个岗位`);
+        }
+        for (const href of targets) {
+          if (applied + skipped >= maxApply) break;
+          await bexec(platform, 'navigate', { url: href, waitUntil: 'domcontentloaded' }, logs, '打开岗位');
+          await sleep(2500);
+
+          // 岗位失效检测：链接可能被风控中转页拦截（如猎聘跳 safe.liepin.com 要求真人短信验证），
+          // 这类页面没有投递按钮，继续跑只会把整批 N 个全判「跳过」，且真人验证通过前重跑必再失败。
+          // 命中即中止整批，立刻给出精准排查方向，避免无谓消耗。
+          const landed = await currentUrl(platform).catch(() => '');
+          if (landed && !isJobPage(platform, landed)) {
+            let host = landed;
+            try { host = new URL(landed).hostname; } catch { /* ignore */ }
+            let redirectHint: string;
+            if (/safe\.liepin\.com/.test(host)) {
+              redirectHint = '（猎聘安全验证中转 safe.liepin.com/verifysms：当前账号会话被要求真人短信验证，自动化无法绕过；请在猎聘调试窗口(9224)完成短信验证后重跑本批次）';
+            } else if (/wow\.liepin\.com/.test(host)) {
+              redirectHint = '（猎聘中转活动页 wow.liepin.com；未登录时也会被拦，请先确认登录态）';
+            } else {
+              redirectHint = '（注意：未登录时也会被拦到这类中转页，请先确认该平台在调试窗口已登录）';
+            }
+            logs.step('岗位失效', false, `链接已重定向到 ${landed}`);
+            const shot = await tryScreenshot(platform).catch(() => undefined);
+            return {
+              platform, status: 'unavailable', logs: logs.logs, screenshot: shot,
+              message: `岗位链接重定向到「${host}」，页面没有投递入口，已中止整批投递${redirectHint}`,
+            };
+          }
+
+          // 注：job51 已在函数顶部（if (platform === 'job51') return runJob51List(...)）整体走列表页直投，
+          // 不会进入本循环；此处一律走通用 oneClickApply。
+          const oc: OneClickResult = await oneClickApply(platform, cfg, logs);
+          if (oc.applied) applied++;
+          else if (oc.needResume) { skipped++; needResume = true; } // 单个岗位缺简历不中断整批，继续下一个
+          else skipped++;
+          // 每完成一个岗位回收多余标签页（同域只留一个）：
+          // 避免用户反馈的「一个点击事件占一个窗口」——会话失效时旧实现会新建标签且从不回收。
+          // 用 sameHostOnly 限定同域，防止误关同一端点上其它平台的标签。
+          try {
+            const rec: any = await bexec(platform, 'closeExtraTabs', { sameHostOnly: true }, logs, '回收多余标签页');
+            const closed = Number(rec?.data?.closed || 0);
+            if (closed > 0) logs.step('标签回收', true, `已关闭 ${closed} 个多余标签页（同域只保留 1 个）`);
+          } catch { /* 回收失败不影响投递 */ }
+          // 岗位间留白，降低触发 51job 风控滑块的频率
+          await sleep(3000);
+        }
+        if (applied + skipped >= maxApply) break;
+      }
+
+      // 翻页
+      const nextR = await bexec(platform, 'click', { text: '下一页', timeout: 4000 }, logs, `翻到第${p + 2}页`);
+      if (!nextR.ok) break;
+      await sleep(3000);
+    }
+
+    if (needResume && applied === 0) {
+      return { platform, status: 'need_resume', message: `前程无忧账号缺少可用在线简历，已被引导至简历中心，无法投递。请先在 51job「简历中心 → 在线简历」创建/完善一份在线简历并设为默认，再重试。`, logs: logs.logs };
+    }
+    const status = applied > 0 ? 'applied' : 'need_manual';
+    return { platform, status, message: `批量投递完成：成功 ${applied}，跳过 ${skipped}`, logs: logs.logs };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, screenshot: shot };
+  }
+}
+
+/** search：仅收集岗位，不投递 */
+async function runSearch(input: ApplyInput): Promise<ApplyResult> {
+  const platform = input.platform;
+  const cfg = getPlatform(platform);
+  if (!cfg) return unsupported(platform);
+  const logs = new ApplyLogger();
+  const kw = input.keyword || '';
+
+  try {
+    await bexec(platform, 'navigate', { url: cfg.searchUrl(kw), waitUntil: 'domcontentloaded' }, logs, kw ? `搜索「${kw}」` : '打开职位列表');
+    await sleep(3500);
+
+    const logged = await ensureLoggedIn(platform, cfg, input, logs);
+    if (!logged) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_login', message: '未登录，请在打开的浏览器中登录后重试', logs: logs.logs, screenshot: shot };
+    }
+
+    const linksRes = await bexec(platform, 'eval', { script: cfg.collectLinksScript }, logs, '收集岗位链接');
+    const links: string[] = Array.isArray(linksRes.data) ? linksRes.data : [];
+
+    const titlesRes = await bexec(
+      platform,
+      'eval',
+      {
+        script: `(() => Array.from(document.querySelectorAll('a')).map(a => ({ h: a.href, t: (a.innerText || '').replace(/\\s+/g, ' ').trim() })).filter(x => x.h && /job|job_detail|jobs\\.51job|liepin\\.com\\/job/.test(x.h) && x.t).map(x => x.t))()`,
+      },
+      logs,
+      '收集岗位标题',
+    );
+    const titles: string[] = Array.isArray(titlesRes.data) ? titlesRes.data : [];
+
+    const foundJobs = links.map((url, i) => ({ title: titles[i] || '职位', url }));
+    return { platform, status: 'found', message: `在${cfg.label}收集到 ${foundJobs.length} 个岗位`, logs: logs.logs, foundJobs };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, screenshot: shot };
+  }
+}
+
+/**
+ * 服务端 BOSS 采集并入库（复用正在运行的 CDP 会话）。
+ * 用于「岗位池自动补充」：当批量连投候选池耗尽时，按档案目标职位关键词重新搜索 BOSS、
+ * 抽取卡片（职位/公司/薪资/链接）入库为 candidate。需 BOSS CDP 在线且已登录；
+ * 否则 ensureLoggedIn 走验证码登录或返回 false，由调用方 catch 吞掉、绝不阻断投递。
+ * 返回新入库岗位数。
+ */
+export async function collectBossToDb(
+  limit = 40,
+  /** 投前实时采集的定向参数：关键词/城市由批量投递的筛选条件透传（2026-10-05） */
+  opts?: { keywords?: string[]; cityCode?: number; cityName?: string | null },
+): Promise<number> {
+  const cfg = getPlatform('boss');
+  if (!cfg) return 0;
+  const logs = new ApplyLogger();
+  const profile = db.getProfile() as Record<string, unknown> | undefined;
+  const targets = parsePositions(profile?.expectedPositions).filter(Boolean);
+  const kwList = (opts?.keywords?.length ? opts.keywords : targets.length ? targets : ['Java开发', '软件开发', '前端开发', '测试工程师']).slice(0, 5);
+
+  // 与 scripts/collect_boss.ts 同款抽取：从搜索卡片取 职位/公司/薪资/直链
+  const EXTRACT = `(() => {
+    const ABS = (h) => { try { return new URL(h, location.href).href; } catch (e) { return ''; } };
+    const PUA = /[\\uE000-\\uF8FF]/;
+    const out = []; const seen = new Set();
+    document.querySelectorAll('.job-card-wrap').forEach(card => {
+      const a = card.querySelector('a[href*="job_detail"]'); if (!a) return;
+      const url = ABS(a.getAttribute('href')).split('?')[0]; if (!url || seen.has(url)) return;
+      seen.add(url);
+      const position = ((card.querySelector('.job-name') || {}).innerText || a.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 50);
+      const company = ((card.querySelector('.boss-name') || {}).innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
+      let salary = ((card.querySelector('.job-salary') || {}).innerText || '').trim();
+      if (PUA.test(salary)) salary = '';
+      out.push({ url, position, company, salary });
+    });
+    return out;
+  })()`;
+  const EXCLUDE = ['销售','顾问','运营','客服','人事','财务','行政','文员','护士','老师','教师','导购','司机','普工','商务','中介','主播','兼职'];
+  const KEEP = ['开发','java','前端','软件','程序','技术','工程师','web','后端','全栈','api','算法','测试','运维','数据','python','go','c++','计算机','net','架构'];
+
+  let inserted = 0;
+  const searchUrl = (kw: string) =>
+    `https://www.zhipin.com/web/geek/jobs?query=${encodeURIComponent(kw)}&city=${opts?.cityCode ?? 100010000}`;
+  for (const kw of kwList) {
+    if (inserted >= limit) break;
+    try {
+      await bexec('boss', 'navigate', { url: searchUrl(kw), waitUntil: 'domcontentloaded' }, logs, `采集搜索「${kw}」`);
+      await sleep(3500);
+      const logged = await ensureLoggedIn('boss', cfg, { platform: 'boss', profile: db.getProfile() as any, sinceMinutes: 10 } as ApplyInput, logs);
+      if (!logged) { console.warn('[Refill] BOSS 未登录，跳过自动补充'); break; }
+      for (let i = 0; i < 6; i++) { await bexec('boss', 'eval', { script: 'window.scrollBy(0,1000);"ok"' }, logs, '滚动加载'); await sleep(600); }
+      const r = await bexec('boss', 'eval', { script: EXTRACT }, logs, '抽取岗位');
+      const items = Array.isArray(r.data) ? r.data : [];
+      for (const it of items) {
+        const pos = String(it.position || '').toLowerCase();
+        if (EXCLUDE.some((e) => pos.includes(e))) continue;
+        if (!KEEP.some((k) => pos.includes(k))) continue;
+        db.upsertJob({ source: 'boss', company: it.company || null, position: it.position || null, city: opts?.cityName ?? null, salary: it.salary || null, apply_url: it.url });
+        inserted++;
+      }
+    } catch (e: any) {
+      console.warn('[Refill] BOSS 采集失败：', e?.message);
+      break;
+    }
+  }
+  console.log(`[Refill] BOSS 自动补充入库 ${inserted} 个`);
+  return inserted;
+}
+
+/** again：对 HR 会话复聊（发送回复） */
+async function runAgain(input: ApplyInput): Promise<ApplyResult> {
+  const platform = input.platform;
+  const cfg = getPlatform(platform);
+  if (!cfg) return unsupported(platform);
+  const logs = new ApplyLogger();
+
+  if (!cfg.chatBased || !cfg.hr) {
+    return { platform, status: 'need_manual', message: `${cfg?.label || platform} 非沟通型平台，不支持复聊`, logs: logs.logs };
+  }
+  const target = input.hrGroupId || input.jobUrl || input.job?.apply_url;
+  if (!target) {
+    return { platform, status: 'need_manual', message: '请提供 HR 会话链接(hrGroupId)或岗位链接', logs: logs.logs };
+  }
+
+  try {
+    await bexec(platform, 'navigate', { url: target, waitUntil: 'domcontentloaded' }, logs, '打开 HR 会话');
+    await sleep(2500);
+    const logged = await ensureLoggedIn(platform, cfg, input, logs);
+    if (!logged) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_login', message: '未登录，请先登录', logs: logs.logs, screenshot: shot };
+    }
+
+    // 复聊文案：kind='reply' → 承接聊天的单句回复（不走去重，复聊本就该可重复）
+    const composed = await composeOrUnavailable({
+      platform: cfg.key,
+      kind: 'reply',
+      job: { company: input.job?.company, position: input.job?.position },
+      jd: input.jdText,
+      chatHistory: input.chatHistory,
+      hrGroupId: input.hrGroupId,
+      profile: input.profile as unknown as Record<string, any>,
+    });
+    if (!composed) return coreMissing(platform, 'AI 复聊文案生成');
+    const msg = composed.content;
+    if (!msg) {
+      return { platform, status: 'skipped', message: composed.skipReason || '复聊文案为空，已跳过', logs: logs.logs };
+    }
+
+    let sent = false;
+    for (const sel of cfg.hr.chatInputSel) {
+      const r = await bexec(platform, 'fill', { selector: sel, value: msg, timeout: 5000 }, logs, '填写回复');
+      if (r.ok) { sent = true; break; }
+    }
+    if (!sent) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_manual', message: '未找到聊天输入框', logs: logs.logs, screenshot: shot };
+    }
+    for (const s of cfg.hr.sendSel) {
+      const r = await bexec(platform, 'click', { text: s, timeout: 5000 }, logs, `点击「${s}」` );
+      if (r.ok) break;
+    }
+    await sleep(2000);
+    const shot = await tryScreenshot(platform);
+    return { platform, status: 'applied', message: `已向 HR 发送复聊消息`, logs: logs.logs, screenshot: shot };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, screenshot: shot };
+  }
+}
+
+/** letter：打开岗位 → 发起沟通 → 发送求职信/招呼语 */
+async function runLetter(input: ApplyInput): Promise<ApplyResult> {
+  const platform = input.platform;
+  const cfg = getPlatform(platform);
+  if (!cfg) return unsupported(platform);
+  const logs = new ApplyLogger();
+  const jobUrl = input.jobUrl || input.job?.apply_url;
+  const company = input.job?.company ?? null;
+  const position = input.job?.position ?? null;
+
+  if (!jobUrl) {
+    return { platform, status: 'need_manual', message: '请提供岗位链接以发送求职信', logs: logs.logs, company, position };
+  }
+  try {
+    await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '打开岗位详情');
+    await sleep(2500);
+    const logged = await ensureLoggedIn(platform, cfg, input, logs);
+    if (!logged) {
+      const shot = await tryScreenshot(platform);
+      return { platform, status: 'need_login', message: '未登录，请先登录', logs: logs.logs, company, position, screenshot: shot };
+    }
+    await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '登录后重新打开岗位');
+    await sleep(2500);
+
+    // 沟通型平台：先点开沟通框
+    if (cfg.chatBased) {
+      await bexec(platform, 'eval', { script: cfg.applyScript }, logs, '发起沟通');
+      await sleep(2500);
+    }
+
+    // 求职信：三重去重（台账已写过 / HR已回复 / 岗位记录已标记）命中则直接跳过，
+    // 不发送、不消耗 AI 调用 —— 对应同类产品的「否-已写过」「否-HR已回复」但**理由可读且落库**。
+    const composed = await composeOrUnavailable({
+      platform: cfg.key,
+      kind: 'letter',
+      mode: input.letterMode === 'custom' ? 'custom' : 'ai',
+      templateContent: input.letterTemplate || null,
+      job: { id: input.job?.id, company, position },
+      jd: input.jdText,
+      hrGroupId: input.hrGroupId,
+      hrReplied: input.hrReplied === true,
+      profile: input.profile as unknown as Record<string, any>,
+    });
+    if (!composed) return coreMissing(platform, 'AI 求职信生成', company, position);
+    if (composed.skipped) {
+      logs.step('求职信跳过', true, composed.skipReason);
+      return { platform, status: 'skipped', message: `已跳过：${composed.skipReason}`, logs: logs.logs, company, position };
+    }
+    const msg = composed.content;
+
+    const boxSels = cfg.chatBased && cfg.hr ? cfg.hr.chatInputSel : ['.chat-input', 'textarea[placeholder*="沟通"]', 'div[contenteditable="true"]'];
+    let sent = false;
+    for (const sel of boxSels) {
+      const r = await bexec(platform, 'fill', { selector: sel, value: msg, timeout: 5000 }, logs, '填写求职信');
+      if (r.ok) { sent = true; break; }
+    }
+    if (!sent) {
+      // 非沟通型平台：一键投递（简历即求职信）
+      const oc = await oneClickApply(platform, cfg, logs);
+      const shot = await tryScreenshot(platform);
+      if (oc.needResume) return { platform, status: 'need_resume', message: `前程无忧账号缺少可用在线简历，已被引导至简历中心。请先在 51job「简历中心 → 在线简历」创建/完善一份在线简历并设为默认，再重试。`, logs: logs.logs, company, position, screenshot: shot };
+      return { platform, status: oc.applied ? 'applied' : 'need_manual', message: oc.applied ? '已一键投递（简历已送达）' : '未找到沟通/投递入口', logs: logs.logs, company, position, screenshot: shot };
+    }
+    const sendSels = cfg.chatBased && cfg.hr ? cfg.hr.sendSel : ['发送'];
+    for (const s of sendSels) {
+      const r = await bexec(platform, 'click', { text: s, timeout: 5000 }, logs, `点击「${s}」`);
+      if (r.ok) break;
+    }
+    await sleep(2000);
+
+    // 台账留痕（三重去重①的依据）+ 岗位行标记，避免下次对这个 HR 重复发同一封求职信
+    try {
+      markLetterSent({
+        platform: cfg.key,
+        job: { id: input.job?.id, company, position },
+        hrGroupId: input.hrGroupId,
+        content: msg,
+        source: composed.source,
+      });
+    } catch { /* 留痕失败不影响投递结论 */ }
+
+    const extras: string[] = [];
+
+    // 猎聘：复聊/求职信后主动交换联系方式（发简历 / 换手机号 / 换微信号）
+    if (platform === 'liepin' && input.exchangeActions && input.exchangeActions.length) {
+      const exResults = await runExchangeActions('liepin', input.exchangeActions as any[], logs);
+      const done = exResults.filter((r) => r.outcome === 'clicked' || r.outcome === 'agreed').map((r) => r.label);
+      const pending = exResults.filter((r) => r.outcome === 'pending').map((r) => r.label);
+      if (done.length) extras.push(`已完成交换：${done.join('/')}`);
+      if (pending.length) extras.push(`已在索要中，跳过：${pending.join('/')}`);
+    }
+
+    // 简历聊天图：无 HR 邮箱的岗位用它覆盖「平台内聊天」场景（有邮箱的走 PDF 邮件通道）
+    if (input.chatResume) {
+      // sendChatResume 属核心（生成简历长图 + 各平台聊天发图选择器）⇒ 基础版就地兜底，
+      // 不让桩的异常逃逸（逃逸后 message 里的内部路径会被外层 catch 原样回给用户）。
+      const chat = await coreOrAsync(
+        () => sendChatResume(
+          platform,
+          { id: input.job?.id, company, position, jd: input.jdText || undefined },
+          logs,
+          { profile: input.profile as unknown as Record<string, any> },
+        ),
+        { ok: false, detail: `${CORE_REQUIRED_MESSAGE}：IM 简历卡片` },
+      );
+      extras.push(chat.ok ? `简历聊天图已发送` : `简历聊天图未发送（${chat.detail}）`);
+    }
+
+    const shot = await tryScreenshot(platform);
+    const base = `已向「${company || position || '该岗位'}」发送求职信/招呼语`;
+    return { platform, status: 'applied', message: extras.length ? `${base}；${extras.join('；')}` : base, logs: logs.logs, company, position, screenshot: shot };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, company, position, screenshot: shot };
+  }
+}
+
+/**
+ * 预览（dry-run）：走完导航 → 登录态 → 探测投递入口，**绝不点击**。
+ *
+ * 存在的唯一理由：`engine.ts` 原来对 `preview` 的引用数是 **0** —— 于是
+ * zhilian / liepin / job51（经引擎）/ boss 的非-hello 动作在 `preview:true` 下
+ * 依然会真的点下去。实测已造成一次真实投递（见 common.ts:probeApplyEntry 注释）。
+ */
+async function previewEngineApply(input: ApplyInput): Promise<ApplyResult> {
+  const platform = input.platform;
+  const cfg = getPlatform(platform);
+  if (!cfg) return unsupported(platform);
+  const logs = new ApplyLogger();
+  const jobUrl = input.jobUrl || input.job?.apply_url;
+  const company = input.job?.company ?? null;
+  const position = input.job?.position ?? null;
+  try {
+    if (!jobUrl) {
+      const shot = await tryScreenshot(platform).catch(() => undefined);
+      return {
+        platform, status: 'preview', logs: logs.logs, company, position, screenshot: shot,
+        message: '预览：未提供岗位链接（jobUrl），因此未做任何页面动作，更未点击。需要探测投递入口时请带上 jobUrl。',
+      };
+    }
+    await bexec(platform, 'navigate', { url: jobUrl, waitUntil: 'domcontentloaded' }, logs, '打开岗位详情');
+    await sleep(2500);
+    // 登录态只影响「能不能看到投递入口」，不会产生投递；未登录时如实返回 need_login。
+    const logged = await ensureLoggedIn(platform, cfg, input, logs);
+    if (!logged) {
+      const shot = await tryScreenshot(platform).catch(() => undefined);
+      return {
+        platform, status: 'need_login', logs: logs.logs, company, position, screenshot: shot,
+        message: `预览：${cfg.label}未登录，无法探测投递入口（本次未点击，未产生任何真实投递）`,
+      };
+    }
+    const { hits, screenshot } = await probeApplyEntry(platform, DEFAULT_APPLY_ENTRY_LABELS, logs);
+    return {
+      platform, status: 'preview', logs: logs.logs, company, position, screenshot,
+      message: hits.length
+        ? `预览：${cfg.label}岗位页正常，投递入口「${hits.join(' / ')}」可用；本次未点击，未产生任何真实投递`
+        : `预览：${cfg.label}岗位页正常，但未探测到投递入口按钮（正式投递时可能需要人工介入）`,
+    };
+  } catch (e: any) {
+    const shot = await tryScreenshot(platform).catch(() => undefined);
+    return { platform, status: 'error', message: e?.message || String(e), logs: logs.logs, company, position, screenshot: shot };
+  }
+}
+
+export async function runEngine(input: ApplyInput): Promise<ApplyResult> {
+  // 🔴 预览闸门必须在**分发之前**（见本文件 previewEngineApply 与 common.ts:probeApplyEntry）。
+  //    `search` 动作只收集岗位链接、本来就不投递，拦它反而会让「预览：看能搜到什么」失效，故放行。
+  if (input.preview === true && (input.action || 'hello') !== 'search') {
+    return previewEngineApply(input);
+  }
+  switch (input.action || 'hello') {
+    case 'auto':
+      return batchApply(input, input.keyword || '', new ApplyLogger());
+    case 'keyword':
+      return batchApply(input, input.keyword || '', new ApplyLogger());
+    case 'search':
+      return runSearch(input);
+    case 'again':
+      return runAgain(input);
+    case 'letter':
+      return runLetter(input);
+    case 'hello':
+    default:
+      return runOneClick(input);
+  }
+}
+
+export type { PlatformKey };

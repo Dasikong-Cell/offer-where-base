@@ -1,0 +1,670 @@
+# offer-where · AI 求职管家
+
+一个**本地化、开源、可自托管**的 AI 求职自动化引擎。
+
+> 全流程五大能力：**智能匹配 → 文案撰写 → 自动投递 → 跟进(HR复聊) → 全程 AI 托管，求职者只需准备面试**。
+> 本项目把这套能力在自己的机器上跑起来：数据、简历、账号全在本机，AI 可选接入，不依赖任何商业 SaaS。
+
+---
+
+## 下载 / 安装（Windows 便携包）
+
+> 本节是给**使用者**的入口；只想读代码的可以直接跳到下面的「功能对标矩阵」。
+
+1. 打开 **[Releases](https://github.com/Dasikong-Cell/offer-where/releases)**，下载 **`OfferWhere-Setup.exe`**（约 **362MB**，**一个文件**）。
+   仓库没有 Release 时，可在 GitHub 的 **Actions → Release → Run workflow** 手动触发一次（版本号留空会自动生成 `v<日期>-<短提交号>`）。
+2. **双击它**，会弹出标准的安装程序（**按用户安装，不需要管理员权限**）：
+   - **「选择组件」页可以决定要不要桌面图标**：默认勾选「在桌面上创建快捷方式」，不想要就取消 —— 开始菜单项和卸载入口照常创建，不受影响。
+   - 默认装到 `%LOCALAPPDATA%\OfferWhere`。**装在哪由你决定**：在「选择安装位置」那一页直接改路径，或点「浏览(B)...」选目录。
+   - 点「安装(I)」开始解压。全程约 **1–3 分钟**（实测 118–141 秒，取决于装到哪个盘），该页会显示所需空间 **约 1.1GB**。
+     **12.4 万个文件**是因为**包内自带 Node 运行时** —— 好处是**你无需安装 Node**。
+   - 完成后可以勾选**直接运行** OfferWhere，也可以稍后从开始菜单或桌面图标启动 ——
+     快捷方式由安装程序建好，**不会再出现第二次「安装」提示**。
+   - `offer-where.exe` 是**原生外壳**：拉起本地后端（默认端口 `4400`）与 5 个核心平台调试窗口，就绪后弹出控制台窗口。
+     关窗 = **收进系统托盘**（后端继续跑，正在进行的投递不被打断）；托盘右键「退出」才真正停服。
+   - 要**完全不弹窗**（脚本化部署 / 无人值守）：`OfferWhere-Setup.exe /S /D=D:\OfferWhere`
+     —— 只安装、不启动任何程序，退出码 0 表示成功。**`/D=` 必须放在最后、且不要加引号**（加了会被静默忽略、装到默认位置）。
+   - 无人值守又**不想在桌面放图标**：`OfferWhere-Setup.exe /S /NODESKTOP /D=D:\OfferWhere`
+     —— `/NODESKTOP` 必须写在 `/D=` **之前**（`/D=` 会把它后面的一切都当成路径）。
+   - **卸载**：在「设置 → 应用 → 已安装的应用」里找到 OfferWhere 卸载。
+     **卸载会默认保留 `data\`**（你的简历、采集到的 JD、投递记录），要一起删会单独问你一次。
+   - 旧包 / 源码树里没有 `dist-app\offer-where.exe` 时，双击 **`start_all.bat`** 效果等价 —— 区别只是控制台用 Chrome `--app=` 独立窗口打开，且会多一个黑框控制台。
+3. 首次运行若弹 SmartScreen「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可。
+   两种下载都可能提示：安装包**没有代码签名证书** ⇒ 必然显示「未知发布者」（代码签名证书是付费的，本仓库不分发，无法绕过这一步）；
+   zip 里的脚本则是「网络下载文件」的常规提示。
+
+> **备用方式：便携 zip**（`job-apply-agent-portable.zip`，约 362MB）。适合想自己挑解压位置、或不想用安装程序的情况。
+> 1. 解压到**纯英文路径**（如 `D:\offer-where`）。实测解压后约 **1.11GB / 12.4 万个文件** —— 文件数多是因为**包内自带 Node 运行时**，好处是**使用者无需安装 Node**。
+>    > ⚠️ **别用资源管理器双击 zip 解压**：包内 12.4 万个小文件，「全部解压缩」会非常慢（可能十几分钟以上）。
+>    > 用系统自带的 `tar`（Win10 1803+）或 7-Zip 快得多（实测约 3 分钟）：
+>    > ```bat
+>    > mkdir D:\offer-where
+>    > tar -xf "%USERPROFILE%\Downloads\job-apply-agent-portable.zip" -C D:\offer-where
+>    > ```
+> 2. 双击解压出来的 `dist-app\offer-where.exe`，后续与上面第 2 步相同。
+4. 看控制台首页的 **「开箱自检」** 卡片，按它逐项补齐即可：
+
+   | 自检项 | 你要做什么 |
+   |---|---|
+   | Node 运行时 | 包内自带，**无需操作** |
+   | Google Chrome | 没装就装一个（调试窗口依赖它） |
+   | 平台端口表 | 内置默认端口，**无需手工配置**（`data/browser/cdp.json` 只在要改端口时才需要） |
+   | 平台调试窗口 | `offer-where.exe`（或 `start_all.bat`）会自动开 **5 个核心平台**（BOSS / 猎聘 / 51job / 智联 / 官网）窗口；其余平台双击 `start_platforms.bat`（默认再开 9 个，`start_platforms.bat all` 全开），或在控制台该平台的卡片上点「打开窗口」。窗口起来后**在各自窗口里扫码登录**（各平台登录态互相隔离） |
+   | 简历 | 左侧「**简历 → 简历中心**」→「上传简历」选 PDF / Word（≤8MB） |
+   | AI 能力（可选） | 想用 AI 语义匹配 / AI 文案就复制 `.env.example` 为 `.env` 填 LLM 配置；**不填则回退「规则匹配 + 模板文案」，功能完整可用**，仅质量略降 |
+
+- **前置要求**：Windows 10 1803+（打包/运行用到系统自带 `tar.exe`）与 Google Chrome。各平台登录方式见 `LOGIN_GUIDE.md`。
+- 包内 `version.json` 记录了该包对应的**提交号与构建时间**，可随时核对自己在用哪一版。
+
+### 校验下载完整性（发给别人时强烈建议一起给）
+
+包是 380 MB 的单文件，中途断流可能下到残缺文件（双击会报「损坏」或直接装到一半）。**校验值由 GitHub 在上传时计算，不是我们自己写死的**：
+
+```bat
+certutil -hashfile OfferWhere-Setup.exe SHA256
+```
+
+对照 Release 页每个附件下方 GitHub 给出的 `digest`（形如 `sha256:xxxx`），或用接口直接读：
+
+```bat
+curl -s https://api.github.com/repos/Dasikong-Cell/offer-where/releases/latest | findstr /i "digest"
+```
+
+当前版本（`v2026.09.29-93cb9ea`）的实测值：
+
+| 文件 | 大小（字节） | SHA-256 |
+|---|---|---|
+| `OfferWhere-Setup.exe` | 379,946,024 | `e1cdfa24e8b98cbd0b3b2badc15949308a53acbc8467899e4836e8fe27c79f65` |
+| `job-apply-agent-portable.zip` | 379,644,378 | `7b8bb9f6d4b16f52e656f7b4827d18611bf279998c1371aa10058a2a1d635232` |
+
+> 换版本后这两个值一定变 —— **以 Release 页的 `digest` 为准**，表里只是留档。
+
+### 下载慢 / 拉不动（中国大陆）
+
+GitHub Release 在国内经常只有几百 KB/s 甚至中断，三种可靠兜底（**任选其一，下完都要比对上面的 SHA-256**）：
+
+1. **换网络 / 挂代理**再试，或用支持断点续传的下载器（迅雷、IDM、Motrix）——380 MB 单文件断点续传很有用。
+2. **第三方加速镜像**：把 Release 直链前面拼上镜像前缀（如 `https://ghfast.top/https://github.com/...`）。
+   镜像是**第三方服务**，只用来加速，**下完必须比对哈希**；镜像挂了就换下一个或直接走原链。
+3. **由发布者直接给文件**：网盘 / 微信 / U 盘都行 —— 本质是同一个 `OfferWhere-Setup.exe`，收方比对哈希即可。
+
+> gitee 镜像仓库**放不了**这个包：gitee 单个 Release 附件上限 100 MB，而包是 380 MB。仓库代码同步在 gitee，但**发布只走 GitHub Release**。
+
+> ⚠️ **已知缺口：安装程序不检测也不安装 WebView2 运行时**（详见 `DEVELOPMENT.md`「已知缺口」一节）。
+> 正常 Windows 10/11 都**已预装**，可直接用；但 **LTSC / Windows Server / 精简版**系统可能没有，
+> 装完双击 `offer-where.exe` 会是**空白窗口**（表象很像崩溃，其实是缺运行时）。
+> 遇到就先装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Evergreen Bootstrapper 约 1.8 MB，需联网一次）；
+> **不想折腾就改双击 `start_all.bat`** —— 它用 Chrome `--app=` 打开控制台，绕开 WebView2，功能等价。
+
+> ⚠️ **首次使用默认只做「预览」**：真实投递会**不可撤销地**向 HR 发出消息。建议先预览、确认无误、把简历与各平台登录态准备好，再切到真实投递。
+
+---
+
+## 功能对标矩阵
+
+| 能力 | offer-where 实现 | 说明 |
+|---|---|---|
+| 🔍 **智能匹配** | `/api/jobs/match` + `matchResumeToJobAi` | 接 LLM 时对「简历 vs JD」做语义打分(0-100)+命中/缺失/建议；无 LLM 自动回退本地规则匹配，**离线可跑** |
+| ✍️ **文案撰写** | `letterWriter` + `aiClient` | 按 JD/公司/岗位生成个性化招呼语与 HR 复聊回复；接 LLM 时 AI 生成，否则模板兜底 |
+| 🚀 **自动投递** | `engine.ts` 跨平台引擎 | BOSS直聘 / 智联 / 前程无忧(51job) / 猎聘 / 牛客 / offerbiu(校招邮箱) 多平台，支持单投/批量/关键词/搜索收集 |
+| 💬 **跟进（HR复聊）** | `autoReply.ts` / `bossChat.ts` | BOSS 自动读取会话、按意图生成回复、自动发送；识别拒聊/已读不回等状态 |
+| 🖥️ **全程 AI 托管** | `public/console.html` 单一控制台 | 多选平台 + 数量/间隔 + SSE 实时进度 + 一键启动，浏览器里完成全套操作 |
+| 📄 **简历解析** | `/api/resume/parse` | 解析 PDF/Word 简历为结构化文本与技能列表，供匹配与投递复用 |
+| 📄 **一岗一简历** | `/api/jobs/tailor` + `/api/jobs/tailor-resume` | 按 JD 定制：技能按相关度重排 + 定制「核心优势」+ 命中/待补分析。**已接入投递**——可生成定制简历 PDF 作为邮件附件（`tailorResume` → HTML → Chrome 排版 → PDF，带内容哈希缓存）。LLM 优先、本地规则兜底，**严禁编造**事实 |
+| 🩺 **平台可用性巡检** | `/api/platforms/health` | 把「连接 / 登录态 / 风控」收敛成**一个结论 + 一条处置建议**，消除「跑完 50 个却投出 0 个」的静默失败 |
+| 📊 **投递漏斗 + 匹配度看板** | `/api/stats/funnel` | 全池按状态/来源聚合（候选/已投/不可用/已隔离），匹配分覆盖度与高/中/低分布，控制台实时展示 |
+| 🔐 **平台 API 通道** | `platformApi/bossOpenApi.ts` | CDP 读取已登录会话 Cookie（含 httpOnly）做**登录态巡检**；逆向 JSON 只读检索提速。**结论：官方开放平台是 B 端，求职者侧无法用它投递**（详见 `docs/BOSS_OPENAPI_PLAN.md`） |
+
+> 说明：**模拟面试 / 笔试题库 / 简历润色** 属于世纪云端另一产品「职达鸭」范畴，不在本仓库（job-apply-agent）范围内。
+
+---
+
+## 架构
+
+```
+offer-where/
+├── server/                      # 后端（Node + Express + TypeScript，tsx 直跑）
+│   ├── index.ts                 # 路由入口（/api/health, /api/jobs/match, /api/apply/batch, /api/chat ...）
+│   ├── services/
+│   │   ├── apply/
+│   │   │   ├── aiClient.ts      # 统一 OpenAI 兼容 LLM 客户端（软失败，未配置返回 null）
+│   │   │   ├── matchAi.ts       # AI 智能匹配（回退规则匹配）
+│   │   │   ├── letterWriter.ts  # AI 文案撰写（回退模板）
+│   │   │   ├── engine.ts        # 跨平台一键/批量投递引擎
+│   │   │   ├── batch.ts         # 自动筛选 + 批量连投编排
+│   │   │   ├── autoReply.ts     # BOSS 自动复聊
+│   │   │   ├── bossChat.ts      # BOSS 会话读写
+│   │   │   ├── job51.ts / zhilian.ts / liepin.ts / nowcoder.ts / offerbiu.ts
+│   │   │   └── platforms.ts     # 平台配置注册表
+│   │   ├── match.ts             # 本地规则匹配（兜底）
+│   │   └── resume.ts            # 简历解析
+│   └── db.ts                    # SQLite（better-sqlite3）
+├── src/                         # 前端（React + Vite + @tencent-ai/agent-sdk）：Agent 分析界面，npm run dev 使用
+├── public/console.html          # 生产控制台入口（由 4400 托管）
+├── scripts/                     # 脚本工具（登录引导、采集等）
+├── data/                        # 本地数据（岗位库 / 投递记录 / 会话 / 截图）—— 不入库
+├── node/                        # 自带 Node 运行时（便携包用，免安装）
+└── *.bat                        # Windows 一键启动器（含 %USERPROFILE% 规避中文路径 + UTF-8 BOM）
+```
+
+**浏览器自动化**：通过本地 CDP Chrome 多实例（各平台独立端口 `9223`~`9227`、`C:/chrome-cdp-profile*` 登录态隔离，见 `data/browser/cdp.json`）驱动各招聘站点；服务端默认监听 **4400**。
+
+---
+
+## 前端界面：两套并存与分工
+
+本项目**同时存在两套前端**，由不同运行模式驱动，共用同一后端 API（无接口断链）：
+
+| 界面 | 技术 | 由谁托管 / 何时用 | 主要功能 |
+|---|---|---|---|
+| `public/console.html` | 原生 JS 单页 | **生产控制台**：`npm run server`（或 `start_all.bat`）在 `/` 直出（默认 `4400`） | 平台多选、自动识别有连接的平台、批量投递、自动回复/消息跟进面板、SSE 实时日志 |
+| `src/`（React + Vite + `@tencent-ai/agent-sdk`） | React SPA | **开发 / Agent 分析界面**：`npm run dev` 由 Vite 在 `5173` 提供，经 CORS 调后端 | Agent 对话(`ChatPage`)、岗位匹配(`JobMatchPage`)、投递记录(`ApplicationsPage`)、档案(`ProfilePage`)；`vite build` 产物在 `dist/` |
+
+- 后端 `server/index.ts` 同时提供**投递类**（`/api/apply/batch`、`/api/auto-reply/*`、`/api/browser/*` 等，供 console.html）与 **Agent 类**（`/api/chat`、`/api/sessions`、`/api/permission-response` 等，供 React 应用）API。
+- 生产部署以 `console.html` 为准；React 应用用于本地开发期的高级 Agent 分析，二者不冲突、不重复开发。
+- 磁盘上的 `server/**/*.js`、`.d.ts`、`vite.config.js`、`*.tsbuildinfo`、`_*.cjs` 等均为 `.gitignore` 已忽略的构建/临时产物，会由 `tsc`/`vite` 重新生成，**不入库、不影响运行**（运行时用 `tsx` 直跑 `.ts`）。
+
+---
+
+## 支持平台
+
+共 **15 个已登记平台**，分两档：
+
+**① 已接入（可直接批量投递，共 8 个）**
+
+| 平台 | 投递 | 复聊 | 端口 | 采集 | 备注 |
+|---|:---:|:---:|:---:|---|---|
+| BOSS直聘 | ✅ | ✅ | 9223 | DOM | 沟通型，发起沟通即投递；自动复聊最成熟 |
+| 智联招聘 | ✅ | — | 9226 | DOM | 两级采集（公司页→岗位） |
+| 前程无忧 51job | ✅ | — | 9225 | DOM | 列表页直投，规避 JD 详情页风控 |
+| 猎聘 | ✅ | ✅ | 9224 | DOM | 需短信验证后使用 |
+| 牛客网 | ✅ | — | 9237 | DOM | 校招/内推 |
+| offerbiu（校招邮箱/官网） | ✅ | — | 9227（与 official 共用） | — | 走 HR 邮箱投递通道 |
+| **国聘** | ✅ | — | 9235 | **API** | `POST gp-api.iguopin.com/api/jobs/v1/list` **匿名可调**，一次返回 30+ 字段**含 JD**；投递入口「申请职位」。岗位偏央企国企 |
+| **鱼泡直聘** | ✅ | — | 9232 | DOM | 详情页 `/zhaogong/{id}.html`；投递入口「聊一聊 / 发送简历」。⚠️ 蓝领垂直，**实测昆明 33 个岗位全是打包工/店员/司机，零技术岗** |
+
+> 国聘采集：`scripts/collect_iguopin.ts`（API，秒级；`--city=昆明` 可过滤）｜ 鱼泡采集：`scripts/collect_yupao.ts`（列表+详情）
+> 两者投递均**需先登录**；服务端已实现 `preview` 只读预览分支，可零风险自测。
+
+**② 已登记、投递实现待接入**（窗口/巡检/控制台已就绪，登录后需实机校准页面选择器）
+
+| 平台 | 端口 | 域名 | 备注 |
+|---|:---:|---|---|
+| 易直聘 | 9228 | easyzhipin.com | 以 APP 为主，Web 端目前是落地页，需先评估可操作性 |
+| 58同城招聘 | 9229 | km.58.com/job/ | 求职频道为**城市子域**（非 jobs.58.com，那是58集团自招官网）；未登录跳登录墙 |
+| 中华英才网 | 9230 | chinahr.com | 已并入「新华英才」，域名不变 |
+| 店长直聘 | 9231 | dianzhangzhipin.com | BOSS 同集团。可采集（`/joblist/{city}/` + `/job/{id}.html`），但**PC 端登录/注册均跳 APP 下载页 → Web 投递不可行** |
+| 脉脉高聘 | 9233 | maimai.cn/gaopin | 脉脉旗下招聘模块 |
+| 赶集招聘 | 9234 | ganji.com/zhaopin/ | 58 同集团；**首访常触发风控验证码**，需人工过一次 |
+| 应届生求职网 | 9236 | yingjiesheng.com | 校招垂直 |
+
+> 说清楚口径：**「已登记」≠「能自动投递」**。第二档平台在控制台里可选、能被巡检（查连接与登录态）、
+> 能启动独立调试窗口，但点投递会明确返回「已登记、投递实现待接入」，不会静默失败。
+> 接入某个平台 = 实现 `runXxx` → 从 `PENDING_PLATFORMS` 移到 `SUPPORTED_PLATFORMS`，测试会自动校验六处同步。
+>
+> 启动额外平台窗口：`start_platforms.bat job58 yupao`（不带参数=启动第二档 9 个；`all`=全部 15 个）。
+>
+> 各平台登录态特征词：`anon` 于 2026-09-21 用调试窗口**实机访问首页采集**；`logged` 为通用保守值，
+> 首次登录后建议用控制台 🩺 复核并按需补充（保守取值只会在匹配不上时判 `unknown`，不会误报"已登录"）。
+
+---
+
+## 快速开始（Windows 一键）
+
+> **前置要求**：① Windows 10 1803+（需系统自带 `tar.exe`）；② 已安装 **Google Chrome**（未装时启动器会明确提示并给出下载链接）。
+>
+> **两种拿包方式**（详见上一节）：
+> - **`OfferWhere-Setup.exe`（推荐，一个文件）**：双击 → 走一遍安装向导（**装在哪由你选**）→ 装到本地并可选直接运行，不需要管理员权限。
+> - **`job-apply-agent-portable.zip`**：含自带 Node 与各启动器，解压到任意机器双击即用，无需安装 Node 环境
+>   （约 362MB，解压后约 1.11GB / 12.4 万个文件；文件多，建议用 `tar` 或 7-Zip 解压）。
+
+1. 双击 **`dist-app\offer-where.exe`**（原生外壳）：自动启动 CDP Chrome + 后端(4400)，然后用**原生窗口**加载控制台（无地址栏/标签栏，任务栏显示本应用图标）。
+   - 关窗 = 收进系统托盘（后端继续跑）；托盘「退出」才停服。
+   - 用**安装包**时不必手动建入口：开始菜单与桌面图标由安装程序直接建好（首跑的「安装」对话框因此不会再出现）。
+     用 **zip** 时才需要双击一次 `create_desktop_shortcut.bat` —— 它会把桌面「OfferWhere」优先指向 `dist-app\offer-where.exe`，没有该文件时才回退 `start_all.bat`。
+   - 包里没有 `dist-app\offer-where.exe` 时（旧包 / 源码树），改双击 `start_all.bat`：它用 Chrome `--app=` 打开独立控制台窗口，效果等价。
+   - 两者都默认**只**启动 **BOSS / 猎聘 / 51job / 智联 / 官网** 5 个平台窗口 —— 刻意不默认开满 15 个（多开 Chrome 很吃内存）。
+   - **其余平台按需开**：在控制台首页对应的平台卡片上点「打开窗口」，即可拉起该平台窗口并置顶（先登录再投递）。也可以跑 `start_platforms.bat`（无参再开 9 个，加 `all` 开满 15 个）。
+2. **看控制台首页的「开箱自检」面板**：它会把「还差什么」列清楚（Chrome / 调试窗口 / 简历 / AI）。
+3. 在控制台勾选平台、设置数量/间隔，**先点「仅预览」**确认链路，再点「开始投递」。
+4. 首次使用需在打开的 Chrome 里登录各招聘平台账号（登录态持久化在 `C:/chrome-cdp-profile`）。
+   逐个平台的登录地址与常见风控（滑块 / 短信验证）见 [`LOGIN_GUIDE.md`](./LOGIN_GUIDE.md)。
+
+> **平台端口无需手工配置**：端口表内置在 `server/services/platformPorts.ts`（与 `start_all.bat` /
+> `start_platforms.bat` 打开的端口一致），开箱即用。`data/browser/cdp.json` 仅用于**覆盖**默认端口
+> （例如把某平台改到别的端口），缺失不影响使用。
+
+---
+
+## 接入 AI（可选）
+
+未配置 AI 时，项目以**「规则匹配 + 模板文案」**模式完整运行。配置任意 OpenAI 兼容网关后，自动切换为**「AI 语义匹配 + AI 文案 + AI 自动复聊」**。
+
+### 配置（`.env`）
+
+根目录 `.env`（参考 `.env.example`）设置以下三项，**三者齐备才启用 AI**，否则所有 AI 调用自动回退规则/模板（软失败，不会中断投递）：
+
+```bash
+LLM_BASE_URL=https://api.openai.com/v1      # 或 http://127.0.0.1:11434/v1（本地 Ollama）
+LLM_API_KEY=sk-xxx                          # 本地 Ollama 可留空
+LLM_MODEL=gpt-4o-mini                       # 或 qwen2.5:7b / deepseek-chat ...
+```
+
+兼容：OpenAI / DeepSeek / SiliconFlow / 通义 / 智谱 / Groq / 本地 Ollama 等。
+
+> **加载机制**：后端 `server/env.ts` 在启动时（早于其它模块）解析根目录 `.env` 注入 `process.env`，无需安装 dotenv、也无需在启动命令里手动 `export`。改完 `.env` 重启后端即生效（双击桌面「OfferWhere」或 `start_server.bat`）。
+
+### AI 用在哪
+
+| 能力 | 是否用 AI | 说明 |
+|---|---|---|
+| 智能匹配（`/api/jobs/match`、`matchAi.ts`） | ✅ 启用时 | 简历 vs JD 语义打分；无 LLM 回退本地规则 |
+| 文案撰写（`letterWriter.ts`） | ✅ 启用时 | 招呼语 / HR 复聊文案；无 LLM 回退模板 |
+| **自动回复话术（`autoReply.ts` `composeReplyWithAi`）** | ✅ 启用时 | **HR 复聊直接调用大模型生成语境感知话术** |
+| 自动回复**意图识别**（`detectIntent` / `decide`） | ❌ 始终规则 | 分类任务规则更可控；内置终态判定顺序、疑问句规避等护栏，避免误判 |
+
+**自动回复的「AI + 护栏」设计**：意图识别永远走规则（保证不误回/不乱回），话术生成优先走大模型（结合 HR 原文、意图、求职者档案、最近对话上下文写 1-3 句口语化回复）；模型调用失败或超时则自动回退规则模板，**护栏不因 AI 抽风而失效**。
+
+### 控制台与接口
+
+- 控制台「④ 自动回复」面板新增 **AI 状态徽标**（绿=已启用模型 X / 黄=未配置将回退规则）与 **「AI 生成话术」开关**（默认勾选；未配置时运行自动回退规则）。预览日志标注 `[AI]` / `[规则]`。
+- `GET /api/ai-status` → `{ enabled, model, baseUrl }`，供徽标实时刷新。
+- 命令行：`tsx scripts/auto_reply_boss.ts`（猎聘为 `auto_reply_liepin.ts`）支持 `--no-ai` 强制走规则模板；`--send` 真实发送前建议先预览。
+
+> 设置后 `GET /api/health` 返回 `"ai": true`，控制台可据此提示 AI 已启用。
+
+---
+
+## 主要 API
+
+| 端点 | 方法 | 描述 |
+|---|---|---|
+| `/api/health` | GET | 健康检查（含 `ai` 状态） |
+| `/api/jobs/match` | POST | 用简历对岗位池 AI 打分并排序 |
+| `/api/apply/batch` | POST | 跨平台自动筛选 + 批量连投（SSE 进度） |
+| `/api/apply` | POST | 单岗位一键投递 / 复聊 / 求职信 |
+| `/api/sessions` | GET/POST/PATCH/DELETE | BOSS 会话管理 |
+| `/api/chat` | POST | 本机 Agent 对话（SSE） |
+| `/api/resume/parse` | POST | 简历解析 |
+| `/api/profile` | GET/PUT | 求职者档案 |
+
+---
+
+## 脚本工具速查（scripts/）
+
+所有脚本用 `tsx scripts/<name>.ts [参数]` 运行（项目自带 tsx）。浏览器类脚本统一调用后端 `POST /api/browser/exec`（平台优先的 `ex()` / 平台固定的 `makeEx()`，见下）。
+
+### 统一浏览器执行封装 `scripts/lib/browser.ts`（2026-09-12 新增）
+
+> ⚠️ **踩坑修复**：历史上散落 N 处本地 `ex()` 副本，签名不一致（2 参 `ex(platform, {action})` 与 3 参 `ex(platform, action, args)` 混用）。一旦「定义了 2 参却按 3 参调用」，action 被丢进字符串 spread，后端收不到 action → 400「缺少 action 参数」、`.data` 恒 `undefined`，采集/投递在静默中全失败（offerbiu 扫描曾恒返回 0 条）。
+>
+> 现统一为 `scripts/lib/browser.ts`：
+> - `ex(platform, { action, ... })` 与 `ex(platform, action, args)` **两种写法都支持**；
+> - 平台固定时 `const ex = makeEx('boss')`；
+> - **缺 `action` 直接抛错**（reject），不再静默失败。
+>
+> 新脚本请 `import { ex, makeEx } from './lib/browser.ts'`，不要再本地定义 `ex`。
+
+### 运维 / 体检
+
+| 脚本 | 用途 |
+|---|---|
+| `ensure_chrome.sh` | 一键幂等拉起 5 个 CDP 调试窗口（boss/liepin/job51/zhilian/official），机器休眠/重启后服务端与 CDP 一起掉时首先跑它 |
+| `healthcheck.ts` | 一键体检：后端可达性 / 各平台连接 / 岗位池数量 / 邮箱配置是否就绪 |
+| `selftest.ts` | 只读**业务**回归（38 项）：简历解析/手机号多格式/匹配引擎/邮箱抽取/域名归约/一岗一简历/防幻觉/HTML 渲染 |
+| `tests/unit/` | **单元测试**（123 项，`npm run test:unit`）：来源守卫/令牌与签名 URL/超阈值自动限额/配对码/文本清洗等纯函数，跑在 Node 内置 test runner 上（零新增依赖）。岗位字段清洗是 2026-10-01 从 `selftest.ts` 迁过来的 |
+| `db_report.ts` | 数据库体检（只读）：表行数、岗位池与投递分布、匹配覆盖、数据质量（重复/空JD/记录不一致） |
+| `fix_job_data.ts` | 历史脏数据修复：清洗被加密字体污染的字段、按 apply_url 回填公司名、清理空壳/重复。**默认 dry-run，`--apply` 才写库且自动备份** |
+| `backfill_jd.ts` | 回填岗位 JD 正文（顺带补公司名）。**可续跑、失败不中断**，建议 `--limit=50` 分批跑；`--include-applied` 可连已投岗位一起补 |
+| `calibrate_jd_selectors.ts` | 探测各平台详情页的 JD/公司名选择器（用于校准 `backfill_jd.ts`，只读） |
+| `focus_login.ts <platform> [url]` | 把指定平台调试窗口导航到登录页并置顶，引导用户登录/收验证码 |
+| `check_logins.ts` | **平台可用性巡检**：连接 / 登录态 / 风控三合一 → 一个结论 + 处置建议（判定逻辑与 `/api/platforms/health` 同源）。退出码 0=全可用 1=有未登录或被风控 2=有未知 |
+| `check_console_syntax.ts` | 校验 `public/console.html` 内联脚本语法（提交前拦下模板字面量笔误） |
+| `clean_tabs.ts` | 收敛各平台调试 Chrome 里堆积的标签页（每端点只留 1 个）。**默认 dry-run**，`--apply` 执行 |
+| `backfill_match.ts` | 回填岗位匹配分（本地规则，零 LLM 成本），让漏斗看板「匹配度」覆盖全池 |
+| `test_quarantine.ts` | 自检 offerbiu 邮箱直投的「跨公司串号隔离」闸门（合成岗位，跑完自动清理） |
+
+### 岗位采集
+
+| 脚本 | 用途 |
+|---|---|
+| `collect_multi.ts <平台,逗号> [每平台目标数]` | 多平台搜索列表页采集（job51/liepin/boss），写库 `status=candidate` |
+| `collect_51job.ts` | 51job 两级采集（列表→公司页→岗位直链，规避 SPA 拿不到直链） |
+| `collect_boss.ts` | BOSS 搜索列表页直采（卡片自带岗位详情链接） |
+| `offerbiu_search.ts [关键词] [页数] [入库1/0]` | offerbiu **免登录**定向采集：按关键词搜 companies，解码「投递入口」得真实官网，入库软件岗 |
+| `offerbiu_scan.ts` | offerbiu 免登录扫 companies 页，按软件相关筛选入库 |
+
+### 投递
+
+| 脚本 | 用途 |
+|---|---|
+| `apply_job51.ts` | 51job 投递，**自动跳过校招/应届生岗**（校招需单独简历、跳应届生求职网必失败） |
+| `apply_one_offerbiu.ts` | offerbiu **一次只投一个**岗位（避免频繁跳站，符合「一次一个」操作约定） |
+| `offerbiu_apply.ts` | offerbiu 投递编排 / 单岗投递（官网网申 + 微信推文→HR 邮箱通道） |
+
+### 自动回复（HR 复聊）
+
+| 脚本 | 用途 |
+|---|---|
+| `auto_reply_boss.ts [--send] [--unread] [--limit=N] [--name=张三,李四] [--no-ai]` | BOSS 自动复聊；默认**预览**（不发送），`--send` 真实发送 |
+| `auto_reply_liepin.ts` | 猎聘版，参数同上 |
+
+
+---
+
+## 反检测（绕过风控 / 减少反复登录）
+
+**根因**：裸 CDP 驱动的 Chrome 会暴露 `navigator.webdriver = true` 与 `cdc_*` 调试器变量，
+BOSS直聘 / 猎聘 / 51job 据此判定为自动化 → 强制重新登录、把页面清空为 `about:blank`、或弹风控墙。
+这正是「需要一直登录」的主因（profile 本身是持久化的，cookie 跨启动保留）。
+
+**已落地方案（2026-09-12）**：
+
+1. **启动参数加固**（3 个启动器 `start_cdp.bat` / `start_all.bat` / `ensure_chrome.sh`）：
+   新增 `--disable-blink-features=AutomationControlled --disable-infobars`，
+   让 Chrome 在 CDP 层就不把 `navigator.webdriver` 置真。
+2. **运行时反检测注入**（`server/services/cdpDriver.ts` 的 `STEALTH_SRC`）：
+   经 `Page.addScriptToEvaluateOnNewDocument` 在每个页面 `document_start` 阶段执行（**Page 域命令，
+   不开启 `Runtime.enable`**，因此不会触发 BOSS 对 `Runtime.enable` 的检测）。它：
+   - 抹掉 `cdc_*` 调试器指纹变量；
+   - 强制 `navigator.webdriver = false`（与启动参数双保险）；
+   - 移除 `__nightmare` / `__puppeteer_*` 等自动化全局标记；
+   - 补全 `window.chrome.runtime` 桩，避免站点据此判定非真实浏览器。
+   - 覆盖点：首次接触端点时对**所有已有标签（含「养熟」标签）**注入；新建标签同样注入。
+
+**验证方法**（后端重启后，对任一平台）：
+```bash
+# navigator.webdriver 应返回 false（改造前为 true）
+curl -s -X POST http://127.0.0.1:4400/api/browser/exec -H 'Content-Type: application/json' \
+  -d '{"platform":"boss","action":"navigate","url":"https://www.zhipin.com/"}'
+curl -s -X POST http://127.0.0.1:4400/api/browser/exec -H 'Content-Type: application/json' \
+  -d '{"platform":"boss","action":"eval","script":"navigator.webdriver"}'   # => {"data":false}
+```
+
+**生效条件**：
+- 改了 `cdpDriver.ts` 必须 **重启后端**（停 4400 再 `PORT=4400 tsx server/index.ts`）才会加载注入逻辑；
+- 启动参数只在**重新拉起 Chrome 窗口**时生效。运行时注入本身已足够把 `webdriver` 置否，
+  因此即便窗口是旧参数启动的，重启后端后新开/复用的标签也会拿到反检测。
+
+**已知边界（诚实说明）**：
+- 滑块验证码（如 51job 滑块风控）是**轨迹行为分析**，无法可靠自动绕过；本项目保持「人工介入」兜底，
+  不实现会显著提高封号风险的轨迹伪造。反检测只降低「环境指纹」层面的误判，不解决人为滑块。
+- 会话 token 仍有服务端 TTL，长时间挂机后偶发需重新登录属正常，非缺陷。
+
+---
+
+## 投递安全（仅预览 / 每日上限 / 风控信号）
+
+批量投递是**唯一会不可逆地对外产生动作**的功能，因此这里有三道闸门（全部可在控制台看到状态）：
+
+### 1. 仅预览（dry-run）—— 零副作用验证链路
+控制台「投递中心」勾选「**仅预览（不真正投递）**」后，服务端会：
+打开岗位页 → 登录态校验 → 已下线/关闭检测 → 抓取 JD 入库 → **探测投递入口按钮是否可用，但不点击**。
+返回 `status='preview'`，**不写 `applications`、不改岗位状态**。
+
+- 用途：换机器/换账号后先验证「登录态、页面选择器、岗位是否可投」，确认无误再实投。
+- 接口：`POST /api/apply/batch` 带 `{"preview": true}`（对应 `ApplyInput.preview`）。
+- 实测：`previewed=2 / applied=0`，`applications` 计数不变。
+
+### 2. 每日投递上限（保号）
+平台对骚扰式批量投递有**账号级**处罚，且每日额度有限（同类开源项目实测 BOSS 每日沟通上限约 100 次）。
+- 默认 **40 份/平台/天**，可在控制台「每日上限」临时调整（`0` = 不限制，不推荐），或用 `APPLY_DAILY_LIMIT` 设默认。
+- 口径：以 `applications` 表按**本地日期**统计（不是内存计数）—— 重启/多进程/多脚本都一致。
+- 只读查询：`GET /api/apply/quota?platform=boss` → `{used, limit, remaining, blocked, blockedReason, blockedMinutesLeft}`。
+
+### 3. 平台风控信号识别 + 自动封锁
+把「页面信号 → 类别 → 可执行处置」收敛成纯函数 `server/services/riskSignals.ts`（可单测）：
+
+| 类别 | 典型文案 | 处置 |
+|---|---|---|
+| `account_risk` | 账号异常 / 环境异常 / 存在风险 | **不要重试**；人工过校验 + 主动发消息，封 12 小时 |
+| `rate_limited` | **今日沟通人数已达上限** / 操作过于频繁 | **整批中止**并封 6 小时（避免连续重试升级风控） |
+| `captcha` | 访问验证 / 请按住滑块 | 人工过一次即可继续（不封锁） |
+
+命中 `account_risk` / `rate_limited` 后会**立即中止整批**，并写持久封锁标志（`app_kv`）；
+封锁期内后续批次**直接短路不投递**（参考同类开源项目的 `PUSH_LIMIT` 持久标志）。
+控制台会显示封锁原因与剩余时间，人工处理完可点「我已人工处理，解除封锁」提前解封
+（`POST /api/apply/risk-unblock`）。
+
+> 三者的共同原则：**宁可少投，也不把账号玩坏**。批量投递的失败原因会归类汇总进结果摘要
+> （如「未投递原因：匹配度过低×7」），不会再出现「跑完却不知道为什么不投」。
+
+---
+
+## 一岗一简历（按 JD 定制）
+
+按 JD 逐岗定制（核心能力之一）。`server/services/apply/resumeTailor.ts` → `tailorResume(profile, job)`：
+
+- **输出**：技能按岗位相关度重排（JD 命中项前置）+ 定制「核心优势/亮点」+ 命中/待补（gap）分析 + 匹配分 + 可直接渲染的 Markdown。
+- **策略**：LLM 优先（`chatJSON`），未配置或失败**自动回退本地规则** —— 与 `matchAi` 同款降级，离线可跑、绝不影响投递链路。
+- **防幻觉三条硬规则**：① 严禁编造简历中不存在的经历/数字/公司/证书；② LLM 只能改写与重排既有事实；③ LLM 返回的技能会与「档案真实技能」求交集，凭空新增一律丢弃。
+
+```bash
+# 命令行预览（无需起服务）
+# HTTP：POST /api/jobs/tailor  { "jobId": "..." }  或 { "job": { "position","company","jd" } }
+```
+
+### 接入投递：一岗一简历 PDF
+
+邮箱直投时勾选「一岗一简历」即可按各岗位 JD 生成定制 PDF 作为附件：
+
+```bash
+# 单个岗位：生成并返回路径（首次约 8s，之后命中缓存 1s）
+curl -X POST http://127.0.0.1:4400/api/jobs/tailor-resume -H 'Content-Type: application/json' -d '{"jobId":"..."}'
+# 批量投递时自动逐岗生成：POST /api/offerbiu/email-apply 加 "tailor": true
+```
+
+管线：`tailorResume()` → `buildResumeHtml()`（自包含 A4 HTML）→ `cdpDriver.htmlToPdf`（**临时标签页**借调试 Chrome 排版，不打断平台主标签）→ `data/resume_tailored/<公司>-<职位>-<hash>.pdf`。
+三处设计取舍：
+- **不给 HR 看内部信息**：PDF 里只有简历内容，**不含**「匹配度 73/100」「待补 2 项」这类内部分析；
+- **信息零丢失**：定制部分之外的原文完整保留，仅把原文的「专业技能」段替换为重排版本；
+- **缓存键只用输入**：绝不能把 LLM 生成文案纳入哈希 —— LLM 每次输出微变会导致永远缓存不命中（实测踩到）。
+
+---
+
+## 平台 API 通道与「消验证码」路线
+
+```bash
+# 登录态巡检：打印 BOSS/猎聘 的 CDP 端点与关键鉴权 Cookie（含 httpOnly）
+# HTTP：GET /api/platform-api/probe
+```
+
+实测（2026-09-18）：BOSS `wt2 / __zp_stoken__ / bst`、猎聘 `__gc_id / XSRF-TOKEN` 均读取成功 —— 此前只能靠截图肉眼判断登录态。
+
+**核心结论**（详见 [`docs/BOSS_OPENAPI_PLAN.md`](./docs/BOSS_OPENAPI_PLAN.md)）：BOSS/猎聘的「开放平台」**都是 B 端（招聘方/服务商）能力**（企业 IM、简历库、薪资元数据），需企业实名 + IP 白名单，**求职者个人无法用它投递简历**。因此「彻底消验证码」的正解不是找官方 API，而是**把平台登录会话搬出用户本机（云端执行）**——这正是同类云端产品验证码无感的真正原因。
+本仓库当前策略：**CDP 整页链路负责投递**（签名由页面自算，最稳），**JSON 通道只负责检索提速与登录态诊断**，不做签名对抗军备竞赛。
+
+---
+
+## 开发
+
+```bash
+npm install
+npm run dev          # 前端(React, 5173) + 后端(默认 4400)；浏览器开 http://127.0.0.1:5173 使用 React 界面
+npm run build        # tsc -b && vite build（产物 dist/，供自托管/开发用）
+npm run server       # 仅起后端，并在 / 托管 public/console.html（生产控制台，默认 4400，PORT 可覆盖）
+```
+
+### ⚠️ 改完代码必须跑 `npm run verify`（血的教训）
+
+服务端用 `tsx` 直跑 `.ts`，**完全不做类型检查** —— 类型错误在运行期毫无异常、冒烟测试全绿，
+但 `npm run build`（`tsc -b`）会直接失败。2026-09-19 软件测评实测踩到：给 `jobs` 加 `quarantine` 列时
+漏改 `JobRow` 接口，运行时一切正常，**构建却长期是坏的**，直到测评才发现。
+
+```bash
+npm run verify       # = typecheck(tsc -b，含 server/) + console:check(控制台内联 JS 语法)
+npm run test         # = selftest + 合约测试 + 单元测试（CI 同款；离线可跑，不碰浏览器/不联网）
+npm run selftest     # 只读业务回归 38 项（简历解析 / 匹配引擎 / 邮箱抽取 / 一岗一简历；无本地简历文件时自动跳过 A 段）
+npm run test:contract # 合约测试：多为"源码里有没有写对"的静态断言（来源守卫 / 控制台结构 / 打包与发布链路等），500+ 条
+npm run test:unit    # 单元测试 123 项：纯函数「喂输入、断言输出」（Node 内置 test runner，**零新增依赖**）
+npm run hooks:install # 装 git pre-push：推送前自动跑 verify，杜绝「构建坏了没人知道」
+```
+
+**合约测试 vs 单元测试的分工**（2026-10-01 引入单元测试后明确）：
+
+| | 回答的问题 | 失效模式 |
+|---|---|---|
+| `test:contract` | 「代码里**有没有**写对」——某处是否还在用旧写法、某份清单是否齐全 | 只能证明文本存在，**证明不了行为正确** |
+| `test:unit` | 「这个函数**跑起来对不对**」——边界输入给对输出没有 | 覆盖不到跨进程/文件系统的行为 |
+| 真起服务的探针（`_tools/`） | 「**整体**跑起来对不对」——真起后端打 HTTP、真造文件跑清理 | 不随 CI 跑，需手动执行 |
+
+三者互补而非替代：合约测试曾出现「断言的字符串写在它自己的修复注释里」而被自己满足的情况；
+单元测试则抓不到「清单漏了一项」。真的要动的安全路径，三样都写。
+
+`npm run hooks:install` 会设置 `core.hooksPath=.githooks`（配置随 `.githooks/` 一起入库）。
+紧急时可 `git push --no-verify` 跳过。
+
+> 生产一键启动：双击桌面「OfferWhere」（= `offer-where.exe`，无该文件时回退 `start_all.bat`）→ 起 CDP Chrome + 后端(`PORT=4400`) + 打开控制台窗口（console.html）。
+
+### `data/` 目录：哪些能删、哪些删了会丢东西
+
+`data/` 是**全部运行数据**（你的简历、岗位库、投递记录、登录态、证据截图），
+**已 gitignore**：不进发布包、不进 PII 扫描。分发给别人时 `data/` 是空的，首次运行自建。
+
+下表体积来自 2026-10-01 实测（本机 824 MB，其中 89% 是**有意不自动清理**的两块）：
+
+| 路径 | 实测体积 | 是什么 | 能删吗 |
+|---|---|---|---|
+| `data/browser/` | **506 MB**（61%） | 各平台登录态的 Chrome profile | ⚠️ 能删但代价高：8 个平台要**重新登录**。不影响投递记录 |
+| `data/jd_images/` | **234 MB**（28%） | 采集的 JD 截图（OCR 的输入） | ⚠️ 半可再生：库里已有 `jd_source` 文本，图是追溯用的佐证。`DATA_AUTO_LIMIT=full` 会清 30 天以上的 |
+| `data/screenshots/` | 69 MB | 运行期截图 | ✅ 可删，超过 14 天自动清 |
+| `data/evidence/` | 5 MB | **投递操作证据截图** | ❌ 建议留 —— 这是"这一单确实投出去了"的凭据 |
+| `data/resume_tailored/` | 2 MB | 一岗一简历产物 | ❌ 建议留（会重新生成，但历史版本就回不来了） |
+| `data/run_log/` | 1 MB | 运行日志（按天分文件） | ✅ 可删，超过 30 天自动清 |
+| `data/ocr_failed/` | 1 MB | OCR 失败时留存的原图 | ✅ 可删（排查用） |
+| `data/chat.db` | — | **主数据库**（岗位 / 投递 / 会话 / 档案） | 🔴 **绝不能删** |
+| `data/chat.db.bak-*` | — | 自动备份（含 `-wal`/`-shm` 伴生文件） | 自动保留最近 **3 组**（整组保留/整组删除），不用手管 |
+| `data/resume_source.pdf`、`resume_optimized.pdf`、`resume_meta.json` | — | 你的简历本体与元数据 | 🔴 **绝不能删** |
+| `data/.auth_token` | — | 访问令牌 | 🔴 不能删（删了控制台/脚本要重新取令牌） |
+| `data/.pair_code`、`.paired_devices.json` | — | 局域网配对码 / 已配对设备 | ⚠️ 可删：删了所有手机需重新配对 |
+| `data/auto_apply_watch.*`、`auto_reply_watch.*` | — | 自动投递 / 自动回复监视器的**运行状态** | ❌ 不要删（丢状态可能让监视器重复动作） |
+
+**自动限额**：`data/` 总体积超过阈值（`DATA_MAX_MB`，默认 3000MB）时会自动清理，
+档位由 `DATA_AUTO_LIMIT` 控制：
+
+| 档位 | 行为 |
+|---|---|
+| `off` | 只告警（旧行为） |
+| `safe`（默认） | **只收紧保留期**：截图 14→7/3 天、日志 30→14/7 天、备份份数下调。删的都是"本来就该过期"的 |
+| `full` | 在 safe 之上，额外清 `data/smoke` 等调试产物与超过 30 天的 JD 图片 |
+
+超阈值 1.5 倍以上会收紧两档。**任何档位都不会碰** `browser` / `evidence` / `resume_tailored` / `chat.db`
+（不可再生，或正是你要留的证据）—— 所以如果清理后仍超阈值，日志会打出体积构成告诉你是**谁**占的，
+而不是让你以为清理坏了。
+
+手动清理随时可跑（默认 `--dry-run` 之外还会打印完整报告）：
+
+```bash
+npm run data:cleanup                       # safe 档，真清理
+npm run data:cleanup -- --dry-run          # 只看会删什么
+npm run data:cleanup -- --auto-limit=full  # 连调试产物与过期 JD 图一起清
+```
+
+## 部署与安全（分发 / 多人共用）
+
+本服务会**触发真实副作用**（批量投递、邮箱直投发信），因此内置了来源防护：
+
+| 场景 | 配置 | 说明 |
+|---|---|---|
+| 本机自用（默认） | 无需配置 | 仅监听 `127.0.0.1`，CORS 白名单只放行本机来源 |
+| 局域网 / 手机共用 | `HOST=0.0.0.0`<br>（或双击 `start_lan.bat`） | 手机、平板、同事浏览器都能用**同一套数据**。本机网卡来源已**自动并入**白名单，无需手填 `EXTRA_ORIGINS`（该变量仅用于非本机网卡来源） |
+| 公网 / 多租户 | ❌ 不支持 | 需账号体系、数据隔离、托管浏览器，属架构级改造；**请勿直接暴露公网** |
+
+安全机制（`server/services/requestGuard.ts`，有单测覆盖）：
+- **读写一视同仁**：带 `Origin` 的请求必须命中白名单，否则 **403**；
+- 不带 `Origin` 时校验 `Sec-Fetch-Site`，`cross-site` 一律 **403**；
+- **不再对只读方法无条件放行**：存在「带真实副作用的 GET」（如 `GET /api/auto-reply/run?realSend=1`），
+  恶意网页可用 `<img src="http://127.0.0.1:4400/api/...">` 跨站触发（简单 GET 无预检，响应虽读不到，副作用却已发生）；
+- 直接导航（`Sec-Fetch-Site: none`，如双击启动器 / 地址栏打开控制台）与本机脚本 / curl 不受影响。
+- **安全响应头**：`X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`（**防点击劫持**——控制台能触发真实投递，被 iframe 套娃诱导点击风险高）、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、最小 CSP。
+
+### 手机 / 移动端访问（双端共用同一套数据）
+
+桌面端与手机端**连的是同一台后端、同一份 SQLite（`data/chat.db`）**，数据天然互通：一端改动，另一端**刷新即可见**（同一份数据，不是两份）。控制台是同一份 `public/console.html`，桌面与手机共用。
+
+1. 双击 **`start_lan.bat`**（等价于 `HOST=0.0.0.0` 启动；默认不设时仍是仅本机）；
+2. 脚本会打印本机的**局域网访问地址**，控制台侧栏底部也常显同一条；
+3. 手机连**同一个 Wi-Fi**，浏览器打开 `http://<本机局域网IP>:4400`；
+4. **首次访问要输一次配对码**：看服务端窗口里那行「局域网设备首次访问的配对码：`123456`」，
+   在手机页面上填进去即可。之后这台设备刷新就能直接用（不用再输）。
+   > 本机（`http://127.0.0.1:4400`）**从不需要配对** —— 那是你自己这台电脑。
+
+#### 配对码：同网段陌生人的准入闸门
+
+**为什么需要**：鉴权开启后，控制台会把访问令牌注入页面。而"要不要注入"只能按**对方地址**判断，
+可同一 Wi-Fi 下「你自己的手机」和「隔壁同事的笔记本」都是 `192.168.x.x` —— 地址这一维区分不了。
+结果就是：同网段任何设备打开控制台都能拿到令牌，而令牌能触发**真实投递 / 发信**。
+
+配对码补上那条**带外信道**：码只出现在你的服务端窗口和 `data/.pair_code` 里，
+扫描到你 IP 的人看不到你屏幕上的 6 位数字。
+
+| 特性 | 说明 |
+|---|---|
+| 一次性 | 配对成功后**立即轮换**（旧码作废），新码会重新打印。要加第二台设备就再看一眼窗口 |
+| 限速 | 单 IP 5 次 / 5 分钟，全局 30 次 / 5 分钟（防"改 IP 分散爆破"）。6 位码有 100 万种，期望爆破时间以**年**计 |
+| 凭证 | cookie `ow_pair`（`HttpOnly`，HMAC 验签），在册设备存 `data/.paired_devices.json`，默认有效期 1 年 |
+| 本机豁免 | 回环地址不经配对（否则为了安全把正常使用也堵上） |
+| 可关闭 | 启动前设 `PAIRING=off`，退回"地址即信任"的旧行为 |
+| 忘记设备 | 删掉 `data/.paired_devices.json` 即可让所有设备重新配对 |
+
+**移动端界面**：窗口 ≤760px 时侧栏变为**抽屉** —— 顶栏左上角 ☰ 打开，点任一导航项或点遮罩收起。
+（旧实现是 `.side{display:none}`：手机上侧栏直接消失、又无替代入口，等于打开后无法切换任何视图。）
+
+#### 装到手机桌面（PWA：「添加到主屏幕」后就是一个独立 App）
+
+控制台带完整 PWA 支持，**不需要域名、不需要备案、不需要公网**：
+
+- **Android / Chrome**：打开控制台后顶部会出现橙色引导条 → 点「安装」（或浏览器菜单 →「安装应用」）；
+- **iOS / Safari**：点底部「分享」→「添加到主屏幕」（iOS 没有自动安装提示，只能走这个菜单，引导条里已写明）；
+- 装好后桌面多一个图标，**点开就是全屏窗口**，没有地址栏，和电脑端**共用同一份数据**。
+
+引导条只在**手机/平板**且**尚未安装**时出现，点右侧 ✕ 后永久不再提示。
+
+| 文件 | 作用 |
+|---|---|
+| `public/manifest.webmanifest` | 应用名 / 图标 / 独立窗口（`display:standalone`）/ 主题色 |
+| `public/sw.js` | Service Worker：**只满足可安装性，刻意零缓存**（见下） |
+| `public/pwa-*.png`、`apple-touch-icon.png` | 图标，由 `scripts/pwa_icons.py` 从 `public/app.ico` 派生 |
+
+⚠️ **两条必须知道的硬规则**（都是浏览器规定，不是本项目缺陷）：
+
+1. **Service Worker 只在安全上下文可用**（`https` 或 `localhost`）。手机通过 `http://<局域网IP>:4400` 访问时 **SW 拿不到** —— 但 **manifest 依然生效**，「添加到主屏幕」照常可用、照常全屏运行。用 `http://localhost:4400`（电脑自己）访问时 SW 才会注册。这是 Chromium 的既定行为；实测已确认非安全上下文下页面**零报错**、干净降级。
+2. **`sw.js` 刻意不做任何缓存**：手机与电脑读写的是**同一份 SQLite**，一旦给 API 加缓存，手机上看到的就是「上次打开时」的旧记录 —— 双端互通的语义当场碎掉。同理也不预缓存页面（本项目最常见的迭代就是改 `console.html`，缓存住会变成「改了页面没生效」）。代价仅是刷新时多走一次网络，本机/局域网延迟可忽略。
+
+**排障**：手机打不开时依次确认 ① 手机与电脑在**同一网段**（连的是同一 Wi-Fi，不是访客网络/手机流量）；② 电脑防火墙放行 `4400`（首次可能弹「允许访问」）；③ 是**用 `start_lan.bat` 启动**（普通启动只监听回环），且启动窗口里出现了「已暴露到局域网」那行日志。微信内置浏览器常拦截局域网地址，请用系统浏览器（Chrome/Safari）打开。
+
+⚠️ **安全边界**：`HOST=0.0.0.0` 下同网段设备都能**发起**访问，但新设备必须输入**一次性配对码**
+才能拿到访问令牌（见上节）。配对码只打印在你自己的服务端窗口里，同一 Wi-Fi 下的陌生人看不到 ——
+这补上了原先"地址即信任"的缺口。仍然：**不要做端口映射 / 公网暴露**（配对码是为了挡住
+"同网段的陌生人"，不是为对抗公网攻击设计的；公网需要的是账号体系与数据隔离，属架构级改造）。
+后端 `/api/lan` 返回当前监听地址与可访问 URL，控制台据此显示「手机访问」提示。
+
+### 行为变更速览（2026-09-25）
+
+| 变更 | 说明 |
+|---|---|
+| 批量投递**默认排除已投岗位** | `criteria.excludeApplied` 默认 `true`（显式传 `false` 才把已投岗位纳入候选）。此前不传就不过滤，导致已投的高分岗位反复被选中→跳过，真实可投候选永远轮不到 |
+| 「已投」判定改为**平台 + 职位** | 此前无平台维度、且历史 `company` 为空时退化为「只比职位」→ 同名职位跨公司/跨平台被误判已投。现在公司仅当**双方都有值**时才比对 |
+| A/B 对照剔除 `legacy` | 历史未打标数据只计入总量、**不参与对照**（报告里给出 `legacyExcluded`） |
+| 上传 `.docx` 简历**也参与匹配/定制** | 此前上传路由只对 PDF 调解析，Word 简历即便能保存也不参与匹配 |
+| **真·操作录屏** | CDP `Page.startScreencast` 帧流（点击 / 跳转 / 弹窗都被连续捕获）→ 帧序列 + `play.html` 连续播放页；本机装了 ffmpeg 会自动另出 mp4。手动：`POST /api/apply/record-video/{start,stop}`，或控制台「投递操作证据回溯」面板「● 开始录像 / ■ 停止并归档」；**批量投递勾选「记录操作录像」**会每次投递自动录，回看入口写入 `applications.video_path` |
+| 轻量备选 `GET /api/apply/record` | 按间隔**抽帧**（快速取样，非录屏），存到 `data/evidence/rec-*/` |
+| 新增 `GET /api/stats/trend?days=7` | 近 N 天投递趋势，首页看板内联展示 |
+| `data/` 体积阈值 | `DATA_MAX_MB`（默认 3000）：启动清理时超过会往运行日志写一条 ERROR 提醒 |
+
+> 这套机制用于拦截「用户浏览恶意网页时，页面 JS 静默调用本机 API 触发投递/发信」（DNS-rebinding）。
+
+运维要点：
+- 运行日志落盘 `data/run_log/YYYY-MM-DD.log`；启动时自动清理过期截图与超量 DB 备份（`npm run data:cleanup` 可手动跑，`--dry-run` 只统计）。
+- 控制台「运行日志」视图可按**日期 / 级别（INFO|ERROR）/ 关键字**筛选日志，并查看 OCR 失败项原文；
+  首页「运行健康」卡片汇总 ERROR 数 / 日志行数 / OCR 失败数 / 运行状态，侧栏在近 1 天有 ERROR 时显示红点。
+- **运行异常邮件告警**：服务端出现 ERROR（含接口 5xx 兜底）会经邮件通道推送到邮箱，做到无人值守也能第一时间知道。
+  收件人默认=已配置邮箱自己，可用 `ALERT_EMAIL` 指定；同一错误默认 1 小时内不重复、两封间隔 ≥10 分钟（聚合防刷屏）；
+  `ALERT_ENABLED=false` 可关闭。控制台「运行健康」有「测试告警邮件」按钮可一键验证通道。
+- 未捕获异常有全局兜底（保活 + 落日志），不会静默退出。
+- OCR 失败项的模型原文落盘 `data/ocr_failed/`，不丢数据，便于复核。
+
+## License
+
+MIT
+

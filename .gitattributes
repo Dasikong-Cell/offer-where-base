@@ -1,0 +1,8 @@
+# Windows 批处理文件必须保持 CRLF 行尾，否则双击会因 cmd.exe 无法解析 LF 而闪退。
+# 无论克隆者本机 core.autocrlf 如何设置，检出时一律还原为 CRLF。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 第三方 vendored 文件（pdf.js 等）：一律按二进制处理，禁止 Git 做换行转换。
+# 否则 1.4 MB 的 pdf.js 在检出时被改写字节 ⇒ 任何「比对文件是否被改过」的判断都会失准。
+public/vendor/** -text

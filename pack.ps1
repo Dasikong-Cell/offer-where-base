@@ -1,0 +1,1239 @@
+param([string]$Edition = 'full')
+$ErrorActionPreference = "Stop"
+$root = $PSScriptRoot
+if (-not $root) { Write-Host "[error] cannot resolve script directory"; exit 1 }
+
+# -- EDITION (2026-10-12) -------------------------------------------------------
+# full = the complete app (base + core) -- the LIVE release artifact. Unchanged behaviour:
+#       CI and pack_smoke call this script with no arguments, so full must stay the default
+#       and must keep producing a byte-identical archive.
+# base = the public base edition: packs the GENERATED tree at _tools/core_split/_public
+#       (core files replaced by throwing stubs) and additionally drops the 9 core-only CLIs.
+#       Its node/ runtime and node_modules closure come from THIS repo -- same binaries,
+#       same install; the generated tree has neither of its own.
+# $root  = this repo, always (tooling, denylist, bundled node, git stamp).
+# $srcRoot = the tree actually being packed ($root for full, _public for base).
+$Edition = $Edition.Trim().ToLowerInvariant()
+if ($Edition -ne 'full' -and $Edition -ne 'base') {
+  Write-Host ("::error::-Edition must be 'full' or 'base' (got '" + $Edition + "')")
+  Write-Host "[error] invalid -Edition value"
+  exit 1
+}
+$srcRoot = $root
+if ($Edition -eq 'base') {
+  $srcRoot = Join-Path $root '_tools\core_split\_public'
+  if (-not (Test-Path -LiteralPath $srcRoot -PathType Container)) {
+    Write-Host "::error::base edition tree is missing -- generate it first"
+    Write-Host "[error] expected the generated public tree at _tools/core_split/_public"
+    Write-Host "[error] fix: node _tools/core_split/classify.mjs && node _tools/core_split/gen_public.mjs"
+    exit 1
+  }
+}
+Write-Host ("pack edition: " + $Edition + "  (tree: " + $srcRoot + ")")
+
+# -- CI diagnosability ---------------------------------------------------------
+# GitHub Actions logs are NOT readable without a token, but check-run ANNOTATIONS
+# are. Emitting the `::error::` workflow command turns every failure branch into
+# an annotation, so a red release run can be diagnosed via the public API alone
+# (2026-09-26: v1.0.0's "pack" step failed on the runner while the identical
+# pack.ps1 was green in ci.yml's Windows job, and the log was unreachable).
+# Messages must stay ASCII (this file is ASCII-only; see the encoding note below).
+trap { Write-Host ("::error::pack.ps1 unexpected failure: " + $_.Exception.Message.Replace("`r"," ").Replace("`n"," ")); break }
+
+# Zip destination: PACK_ZIP_DIR (set by CI) wins; otherwise the user's Desktop.
+# Fallback chain exists because GetFolderPath('Desktop') is the one environment
+# assumption this script used to make blindly -- an empty/redirected Desktop
+# would make tar fail with an unexplainable exit 1.
+$destDir = $env:PACK_ZIP_DIR
+if (-not $destDir) { $destDir = [Environment]::GetFolderPath('Desktop') }
+if (-not ($destDir -and (Test-Path $destDir))) {
+  $destDir = $root
+  Write-Host "::error::zip destination directory unavailable, falling back to repo root"
+  Write-Host "[warn] zip destination directory unavailable, falling back to repo root"
+}
+# Base edition gets its own artifact name: it is a DIFFERENT product (no core), and a
+# shared name would let a stale full zip be mistaken for a fresh base build (or vice versa).
+if ($Edition -eq 'base') { $zip = Join-Path $destDir "job-apply-agent-base-portable.zip" }
+else { $zip = Join-Path $destDir "job-apply-agent-portable.zip" }
+$tar = Join-Path $env:SystemRoot "System32\tar.exe"
+if (-not (Test-Path $tar)) { Write-Host "::error::tar.exe not found (needs Windows 10 1803+)"; Write-Host "[error] tar.exe not found (needs Windows 10 1803+)"; exit 1 }
+
+# NOTE: keep this script ASCII-only.
+#  1) PowerShell 5.1 reads a BOM-less .ps1 as ANSI/GBK -> UTF-8 Chinese breaks parsing.
+#  2) Passing non-ASCII args to native exes (robocopy/tar) is unreliable.
+
+$sw = [Diagnostics.Stopwatch]::StartNew()
+
+# -- ALLOW-LIST packaging ------------------------------------------------------
+# Deliver only what an end user needs. Anything not listed here is simply never
+# archived -- that automatically keeps out: .env (API keys!), data/ (personal
+# resume + DB + browser profiles), src/, dist/, .git/, internal reports.
+# Do NOT go back to "--exclude=<name>": bsdtar matches exclude patterns against
+# directory NAMES too, so "--exclude=./dist" also killed node_modules/tsx/dist/
+# and produced a package that could not start.
+$dirs  = @("node", "public")
+# node_modules/ is NOT here on purpose (2026-10-12). It used to be, which meant tar
+# recursed into all 501 top-level entries -- 1025 MB, of which only 200 entries (315 MB)
+# are reachable from the code a recipient actually runs. The rest is the `src/` React
+# development stack (tdesign / mermaid / cherry-markdown / vite / typescript / ...) plus its
+# transitive tree, and it was in every download. See the "dependency CLOSURE" block below:
+# the ship set is COMPUTED from the shipped code's imports, never hand-listed (a hand list
+# omitted `ws`, which server/services/browserHealth.ts imports at runtime).
+# NOTE: do NOT reintroduce tar's --exclude here. bsdtar matches a pattern such as
+# `server/*.js` at ANY path level, so it also deleted node_modules/**/server/*.js
+# (254 dependency files silently lost -- caught by the audit assertion below).
+# Enumerating files explicitly is the only reliable way to scope it to the top level.
+# server/ and shared/ are archived file-by-file so their tsc build artifacts (*.js emitted
+# next to *.ts) can be dropped -- the app runs .ts via tsx, so those .js are redundant and
+# a stale copy could shadow its same-named .ts.
+$splitDirs = @("server", "shared")
+# -- build stamp ---------------------------------------------------------------
+# Every distributed zip must be traceable. History: a hand-made zip on the desktop
+# turned out to be a snapshot of a HALF-FINISHED working tree (some fixes in, some
+# out) matched by no commit at all -- impossible to tell what a recipient had.
+# version.json is written into the archive root and is gitignored.
+$commit = "unknown"
+$dirty = $false
+try {
+  if (Get-Command git -ErrorAction SilentlyContinue) {
+    $c = & git -C $root rev-parse --short HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $c) { $commit = (@($c)[0]).Trim() }
+    $st = & git -C $root status --porcelain 2>$null
+    if ($st) { $dirty = $true }
+  }
+} catch { }
+$stamp = @{
+  commit  = $commit
+  dirty   = $dirty
+  builtAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+} | ConvertTo-Json -Compress
+# version.json is written into the archive root and is gitignored. It goes into $srcRoot
+# (the tree being packed), NOT $root: in base mode the packed tree is _public, and the
+# stamp has to travel inside that archive.
+Set-Content -Path (Join-Path $srcRoot 'version.json') -Value $stamp -Encoding ascii
+Write-Host "[0/2] build stamp: $stamp"
+
+# -- PROVENANCE GUARD, native shell vs source (2026-09-27) ----------------------
+# dist-app/ ships a COMMITTED binary (offer-where.exe + WebView2Loader.dll). Nothing
+# in tsc / selftest / contract / smoke can tell whether that binary still corresponds
+# to src-tauri/, because the assertion has to span "source on disk" and "bytes inside
+# the exe" -- two things no compiler or test runner here compares.
+# build_app.ps1 records the recipe and the hashes into dist-app/BUILD_INFO.json; this
+# recomputes them. Three failure modes, all of them real and all silent otherwise:
+#   (a) a .rs / Cargo.toml changed, or a source file was added or deleted, after the
+#       last build -- the package then ships a binary that predates its own source
+#   (b) the exe or dll was swapped without re-stamping
+#   (c) the stamp was hand-edited to make a mismatch go away
+# The recipe (which directories to skip) is read FROM the stamp, so this file does not
+# carry a second copy of the rule that could rot out of sync with build_app.ps1.
+# ~0.3s over ~10 files, so it runs BEFORE tar: a stale binary costs one second here
+# instead of a 5-minute pack plus a wrong artifact on the release page.
+# -- Source hashing: must stay byte-for-byte identical to build_app.ps1 -------------
+# These two functions are the ONLY duplicated piece of the provenance rule (the
+# exclude list is read from the stamp; the hashing algorithm cannot be). They exist
+# here because pack.ps1 must be able to verify a stamp without running build_app.ps1.
+# scripts/contract_tests.ts re-derives the aggregate hash in TypeScript from the rule
+# recorded in BUILD_INFO.json, so if either copy drifts, the test goes red.
+#
+# (1) CRLF -> LF normalization. Rationale and the CI evidence: see the long comment on
+#     Get-FileSha256Norm in build_app.ps1. Short version: hashing raw on-disk bytes
+#     made the stamp depend on git's autocrlf, so a CRLF checkout (the Windows CI
+#     runner) hashed differently from an LF checkout of the same commit and this guard
+#     refused to pack a tree that was actually correct (run 36331333538).
+# (2) Ordinal (not culture) path order. Sort-Object is culture-sensitive, so the
+#     aggregate depended on the machine locale.
+function Get-FileSha256Norm([string]$Path) {
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  # 28591 = ISO-8859-1: every byte maps to U+0000..U+00FF and back, so binary input
+  # survives the round trip. Decoding as UTF-8 would replace invalid sequences with
+  # U+FFFD and silently hash the wrong bytes.
+  $enc = [System.Text.Encoding]::GetEncoding(28591)
+  $text = $enc.GetString($bytes).Replace("`r`n", "`n")
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  return ([System.BitConverter]::ToString($sha.ComputeHash($enc.GetBytes($text))) -replace '-', '').ToLower()
+}
+
+function Sort-EntriesByPathOrdinal($Entries) {
+  $paths = New-Object System.Collections.Generic.List[string]
+  foreach ($e in $Entries) { $paths.Add([string]$e.path) }
+  $paths.Sort([System.StringComparer]::Ordinal)
+  $map = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+  foreach ($e in $Entries) { $map[[string]$e.path] = $e }
+  $out = New-Object System.Collections.Generic.List[object]
+  foreach ($p in $paths) { $out.Add($map[$p]) }
+  return $out.ToArray()
+}
+
+# One-line byte-level fingerprint of a drifted file, printed with the drift message.
+# WHY: diagnosing the CI failure above took an hour of offline reproduction because the
+# log only said WHICH files differed, never WHY. "on-disk 24218 bytes, 542 CR bytes"
+# would have pointed straight at line endings. Cheap (a few small files) and it only
+# runs on the failure path.
+function Get-DriftHint([string]$RelPath) {
+  try {
+    $abs = Join-Path $srcRoot ($RelPath.Replace('/', '\'))
+    $b = [System.IO.File]::ReadAllBytes($abs)
+    $cr = 0
+    foreach ($x in $b) { if ($x -eq 13) { $cr++ } }
+    return ('  [on-disk ' + $b.Length + ' bytes, ' + $cr + ' CR bytes]')
+  } catch { return '' }
+}
+
+$appDir   = Join-Path $srcRoot 'dist-app'
+$appInfoP = Join-Path $appDir 'BUILD_INFO.json'
+$appExeP  = Join-Path $appDir 'offer-where.exe'
+$appDllP  = Join-Path $appDir 'WebView2Loader.dll'
+$appSrcP  = Join-Path $srcRoot 'src-tauri'
+$missingApp = @($appInfoP, $appExeP, $appDllP) | Where-Object { -not (Test-Path -LiteralPath $_) }
+if ($missingApp) {
+  Write-Host ("::error::native shell artifact missing: " + (($missingApp | ForEach-Object { Split-Path $_ -Leaf }) -join ', '))
+  Write-Host "[error] dist-app/ must contain offer-where.exe, WebView2Loader.dll and BUILD_INFO.json."
+  Write-Host "        Run build_app.ps1, then commit all three together with the src-tauri change."
+  exit 1
+}
+$appInfo = Get-Content -LiteralPath $appInfoP -Raw | ConvertFrom-Json
+
+$curSrc = New-Object System.Collections.Generic.List[object]
+foreach ($f in (Get-ChildItem -LiteralPath $appSrcP -Recurse -File -Force)) {
+  $rel = $f.FullName.Substring($srcRoot.Length + 1).Replace('\', '/')
+  $parts = $rel.Split('/')
+  $skip = $false
+  for ($i = 1; $i -lt ($parts.Length - 1); $i++) {
+    if ($appInfo.excludeDirNames -contains $parts[$i]) { $skip = $true; break }
+  }
+  if ($skip) { continue }
+  $curSrc.Add([pscustomobject]@{
+    path   = $rel
+    sha256 = (Get-FileSha256Norm $f.FullName)
+  })
+}
+$curSrc = @(Sort-EntriesByPathOrdinal $curSrc)
+
+$sb = New-Object System.Text.StringBuilder
+foreach ($e in $curSrc) { [void]$sb.Append($e.path).Append("`n").Append($e.sha256).Append("`n") }
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+$curHash = ([System.BitConverter]::ToString(
+  $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString()))) -replace '-', '').ToLower()
+$stampHash = ([string]$appInfo.sourceHash).ToLower()
+
+$drift = New-Object System.Collections.Generic.List[string]
+$stampMap = @{}
+foreach ($e in $appInfo.sourceFiles) { $stampMap[[string]$e.path] = ([string]$e.sha256).ToLower() }
+$curPaths = @($curSrc | ForEach-Object { $_.path })
+foreach ($e in $curSrc) {
+  if (-not $stampMap.ContainsKey($e.path)) { $drift.Add('added since build: ' + $e.path) }
+  elseif ($stampMap[$e.path] -ne $e.sha256) { $drift.Add('modified since build: ' + $e.path + (Get-DriftHint $e.path)) }
+}
+foreach ($e in $appInfo.sourceFiles) {
+  if ($curPaths -notcontains [string]$e.path) { $drift.Add('deleted since build: ' + [string]$e.path) }
+}
+if ($drift.Count -gt 0 -or $curHash -ne $stampHash) {
+  Write-Host ("::error::native shell is stale: src-tauri/ no longer matches dist-app/BUILD_INFO.json")
+  Write-Host "[error] the committed exe does not correspond to the committed source:"
+  $drift | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  Write-Host ("   stamped sourceHash = " + $stampHash.Substring(0, [Math]::Min(12, $stampHash.Length)) + "...")
+  Write-Host ("   current sourceHash = " + $curHash.Substring(0, [Math]::Min(12, $curHash.Length)) + "...")
+  Write-Host "   Fix: run build_app.ps1, then commit dist-app/ and src-tauri/ in the same commit."
+  exit 1
+}
+foreach ($a in $appInfo.artifacts) {
+  $ap = Join-Path $srcRoot ([string]$a.path).Replace('/', '\')
+  if (-not (Test-Path -LiteralPath $ap)) {
+    Write-Host ("::error::stamped artifact is missing: " + [string]$a.path)
+    exit 1
+  }
+  $ah = (Get-FileHash -LiteralPath $ap -Algorithm SHA256).Hash.ToLower()
+  if ($ah -ne ([string]$a.sha256).ToLower()) {
+    Write-Host ("::error::artifact bytes differ from the stamp: " + [string]$a.path)
+    Write-Host ("   stamped = " + ([string]$a.sha256).ToLower())
+    Write-Host ("   on disk = " + $ah)
+    Write-Host "   Fix: run build_app.ps1 to re-stamp, then commit both."
+    exit 1
+  }
+}
+Write-Host ("      provenance: " + $curSrc.Count + " src-tauri files and " + @($appInfo.artifacts).Count + " artifact(s) match the stamp")
+
+$files = @("package.json", "package-lock.json", "tsconfig.json", ".env.example",
+           "README.md", "DEVELOPMENT.md", "LOGIN_GUIDE.md", "LICENSE", "version.json",
+           # Native shell (2026-09-27). Listed FILE BY FILE, not as the directory:
+           # dist-app/ also holds runtime logs (offer-where.log / .prev) that must never
+           # ship, and `tar -c dist-app` would recurse into them. Passing the three file
+           # paths makes tar create the dist-app parent entry implicitly.
+           # Their contents are checked by the provenance guard above; their presence is
+           # pinned in $must below.
+           "dist-app/offer-where.exe", "dist-app/WebView2Loader.dll",
+           "dist-app/BUILD_INFO.json")
+
+# Only END-USER launchers ship. Repack helpers, CLI one-shots, bash collectors and
+# CDP debug launchers stay in the repo: a recipient facing 20 root entries cannot
+# tell which file to double-click, and none of them is needed to run the app.
+# History (2026-09-25 out-of-box test, P2-2): the first version of this list only
+# dropped the *.bat helpers, so the *.sh one-shots and the repacker itself still
+# shipped -- the comment claimed otherwise, which is exactly how such lists rot.
+# KEEP (deliberately): setenv.bat / start_all.bat / start_server.bat /
+# start_platforms.bat / create_desktop_shortcut.bat (the real launchers plus the
+# desktop-entry helper), and ensure_chrome.sh (README's script table and the
+# console's "window offline" hint still point at it as a manual recovery path).
+# NOTE: all root launchers are ASCII as of 2026-09-26. The desktop-entry helper was
+# renamed FROM a CJK name precisely because a CJK entry inside the zip is stored as
+# GBK bytes WITHOUT the UTF-8 flag, so an English Windows extracts it as mojibake and
+# the recipient cannot even tell which file to double-click.
+# The one remaining CJK-named root script is the legacy repacker (dropped from the
+# package below), so it is built from codepoints at runtime instead of literally.
+$repackBat = ([char]0x6253) + ([char]0x5305) + '.bat'   # legacy robocopy-based packer
+$dropScripts = @(
+  # CDP / one-shot apply launchers
+  'apply_boss.bat', 'apply_job51.bat', 'apply_liepin.bat', 'rerun_liepin.bat',
+  'start.bat', 'start_cdp.bat', 'start_cdp_offerbiu.bat', $repackBat,
+  # bash one-shots and wait loops (need Git Bash on the author's box; useless on a
+  # clean Windows machine, where the console/API is the supported way in)
+  'collect_all.sh', 'offerbiu_auto.sh',
+  'wait_liepin.sh', 'wait_offerbiu.sh', 'wait_zhilian.sh',
+  # the packer itself -- recipients do not build packages
+  'pack.ps1',
+  # the native-shell builder: same reason (recipients do not build the app), plus it
+  # would expose the author's toolchain layout in a package that ships a built exe.
+  'build_app.ps1',
+  # the SFX builder: it concatenates tools\sfx\build\stub.exe into OfferWhere-Setup.exe,
+  # and `tools\` is not shipped. Keeping it would make the launcher cross-reference guard
+  # fire on paths that only exist in the source tree -- a false alarm for the recipient.
+  'make_sfx.ps1',
+  # the NSIS installer builder, same reason (added 2026-09-28 when it became the published
+  # installer). It needs installer\ -- which is not in $dirs and therefore never ships --
+  # plus a makensis on PATH that no recipient has. Recipients run an installer, they do
+  # not build one.
+  'make_nsis.ps1'
+)
+$scripts = Get-ChildItem $srcRoot -File -Force |
+  Where-Object { @('.bat', '.sh', '.ps1') -contains $_.Extension -and $dropScripts -notcontains $_.Name } |
+  Select-Object -ExpandProperty Name
+
+# -- scripts/ pruning (2026-09-26) ---------------------------------------------
+# scripts/ used to ship wholesale. By now ~93 files live there and a third of them
+# are one-off debug instrumentation (DOM probes, diag dumps, temp scripts) that only
+# ever ran on the author's machine. A recipient looking for "how do I collect jobs"
+# cannot tell `diag_chat_sendflow.ts` from `collect_boss.ts`.
+#
+# The line is drawn by KIND, not by "looks unused":
+#   DROP  one-off debug/temp tools (diag*, probe*, peek_*, `_`-prefixed temp scripts)
+#         + dev-only tooling (pack_smoke.ps1 repacks and needs pack.ps1, which never
+#           ships; icon_candidates.py is the icon design scratchpad and needs Pillow)
+#   KEEP  everything else, *including* collectors/checkers that no document mentions
+#         (collect_zhilian.ts, apply_one51.ts, cleanup_data.ts, countjobs.ts, ...).
+#         Those are part of the CLI capability surface -- a user can run them with the
+#         bundled node, and "not mentioned in README" is not evidence of junk.
+# Nothing here is taken on trust: the reference guard below refuses to ship a package
+# in which any drop target is still referenced by a shipped file.
+$scriptDrop = @(
+  # --- one-off debug instrumentation (by kind) ---
+  '_probe_cdp_diag.ts', '_probe_resume_sent.ts', '_tmp_plan_probe.ts',
+  'diag51.ts', 'diag51b.ts', 'diag51c.ts',
+  'diag_boss_list.ts', 'diag_boss_msgs.ts',
+  'diag_chat.ts', 'diag_chat_click.ts', 'diag_chat_dom.ts', 'diag_chat_input.ts',
+  'diag_chat_list.ts', 'diag_chat_resume_pick.ts', 'diag_chat_sendflow.ts',
+  'diag_chat_upload_resume.ts',
+  'diag_job51_jd.ts', 'diag_job51_jd_modal.ts', 'diag_job51_modal.ts', 'diag_login.ts',
+  'peek_page.ts', 'probe2.ts', 'probe_boss_apply.ts', 'probe_chat.ts', 'probe_findim.ts',
+  'probe_imdeep.ts', 'probe_multi.ts',
+  # --- dev-only tooling ---
+  'pack_smoke.ps1',        # repack+smoke driver; pack.ps1 itself is never shipped
+  'nm_shipset.mjs',        # computes the node_modules ship set FOR pack.ps1; build-time only
+  'calibrate_pending.sh',  # bash calibration one-shot (needs Git Bash; author-only)
+  'icon_candidates.py'     # icon candidate renderer (needs Pillow; design-time only)
+)
+
+# -- BASE-EDITION-ONLY drops (2026-10-12) ----------------------------------------
+# The 9 "core-only CLIs" produced by classify.mjs's promotion rule (they import core and
+# carry no core gate, so the whole capability is core). Full edition SHIPS them -- they
+# are part of its CLI surface. Base edition does NOT: a CLI that throws CORE_UNAVAILABLE
+# on every run is dead weight in a download.
+# Why literals and not a live read of the manifest: this script is meant to be copied
+# VERBATIM into the future public base repo, which has no _tools/ and no manifest -- it
+# must stay self-contained. The cross-check below is what keeps the literals from rotting:
+# whenever the manifest IS present (the dev tree), the derived set must match the baked
+# one EXACTLY, or the build fails. "The split evolved and this list was not updated" must
+# be a build error, never a silently wrong package.
+$baseOnlyScripts = @(
+  'check_reply_quality.ts', 'find_real_hr.ts', 'probe_platform_api.ts',
+  'run_offerbiu_email_test.ts', 'send_offerbiu_one.ts', 'tailor_preview.ts',
+  'test_auto_reply.ts', 'validate_reply.ts', 'verify_liepin_chat.ts'
+)
+$mfPath = Join-Path $root '_tools\core_split\manifest.json'
+if (Test-Path -LiteralPath $mfPath) {
+  try {
+    $mf = Get-Content -LiteralPath $mfPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $derivedDrops = @($mf.basePackDrops | Sort-Object)
+    $bakedDrops   = @($baseOnlyScripts | Sort-Object)
+    if (($derivedDrops -join ',') -ne ($bakedDrops -join ',')) {
+      Write-Host "::error::baseOnlyScripts is stale against manifest.basePackDrops"
+      Write-Host ("[error] baked    = " + ($bakedDrops -join ', '))
+      Write-Host ("[error] manifest = " + ($derivedDrops -join ', '))
+      Write-Host "[error] fix: re-run classify.mjs, then update the literal list to match"
+      exit 1
+    }
+    Write-Host ("      base-only drops: " + $bakedDrops.Count + " core-only CLIs (manifest cross-check OK)")
+  } catch {
+    Write-Host ("      [warn] manifest cross-check skipped (unreadable): " + $_.Exception.GetType().Name)
+  }
+} else {
+  Write-Host "      [warn] no manifest next to pack.ps1 -- base-only drops run on the baked list alone"
+}
+# Effective drop table: full = $scriptDrop; base = $scriptDrop + the 9 core-only CLIs.
+# [!] The 9 must NOT be folded into $scriptDrop itself: classify.mjs reads $scriptDrop to
+# decide what SHIPS, and in the public tree these files are published as stubs on purpose.
+# The edition overlay belongs to the packaging layer only.
+$effectiveDrop = $scriptDrop
+if ($Edition -eq 'base') { $effectiveDrop = @($scriptDrop + $baseOnlyScripts) }
+
+$allScriptNames = @(Get-ChildItem (Join-Path $srcRoot 'scripts') -Recurse -File -Force | ForEach-Object { $_.Name })
+$scriptFiles = @(Get-ChildItem (Join-Path $srcRoot 'scripts') -Recurse -File -Force |
+  Where-Object { $effectiveDrop -notcontains $_.Name })
+# fail-closed the other way: a drop entry that no longer exists means the list has rotted.
+# NOTE: compare against $allScriptNames (the unfiltered listing) -- comparing against
+# $scriptFiles would always report every entry as stale, since that list is the result
+# of removing them (2026-09-26: wrote it the wrong way round first; the guard failed
+# loudly rather than silently passing, which is the point of fail-closed).
+# CORRECTION (2026-09-27, first CI run of 934430e, the "script slimming" commit): this check originally
+# required EVERY drop entry to exist on disk ($allScriptNames). That made the package
+# UNBUILDABLE on a clean checkout. Five entries -- _probe_cdp_diag.ts, _probe_resume_sent.ts,
+# _tmp_plan_probe.ts, probe_findim.ts, probe_imdeep.ts -- match the .gitignore rules for
+# local probe/temp scripts, so they exist on the author's disk but NEVER in the repo.
+# The author's pack went green, the runner's died with "scriptDrop is stale" and took the
+# whole Release pipeline down with it. Local-green / CI-red is the worst possible shape for
+# a guard: it hides in the one environment that never runs.
+# An entry is genuinely stale only if the repo USED TO track that file and it is gone from
+# disk now (renamed or deleted -- which is exactly what would silently start shipping it
+# again). Untracked drop targets are allowed to be absent.
+# Base mode asks the GENERATED tree's own git (the nested index pii_scan_public.sh / a
+# future `git init` in _public creates). When that index is absent the check stands down
+# exactly as it does outside any work tree -- it says so instead of guessing.
+$trackedNames = @()
+try {
+  $trackedNames = @(& git -C $srcRoot ls-files scripts 2>$null | ForEach-Object { ($_ -split '/')[-1] })
+} catch { }
+$staleDrops = @($effectiveDrop | Where-Object {
+  $allScriptNames -notcontains $_ -and $trackedNames -contains $_
+})
+if ($staleDrops) {
+  Write-Host ("::error::scriptDrop entries no longer exist in scripts/: " + ($staleDrops -join ', '))
+  Write-Host "[error] scriptDrop is stale (file renamed or removed?):"
+  $staleDrops | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+
+# fail-closed the THIRD way: every script that WILL be shipped must be TRACKED BY GIT.
+# Why this exists (2026-09-27): probe_chat.ts lives on the author's disk but is gitignored,
+# and it was missing from $scriptDrop -- so the author's zip shipped 67 scripts while the
+# runner's shipped 66. The difference is invisible in every log line; it only shows up if you
+# diff the two pack outputs by hand. That means the artifact handed to a stranger was NOT the
+# artifact CI builds, for a reason nobody would ever notice.
+# Same equivalence as the stale-drop check above: "a file exists in CI" == "git ls-files
+# knows about it". So a shipped-but-untracked script is precisely a file CI cannot have.
+# Guarded on $trackedNames being non-empty: outside a git work tree (or without git) this
+# check cannot know anything, so it stands down and says so rather than false-failing.
+$untrackedShipped = @($scriptFiles |
+  Where-Object { $trackedNames -notcontains $_.Name } |
+  ForEach-Object { $_.Name } | Sort-Object)
+if ($trackedNames.Count -eq 0) {
+  Write-Host "      scripts/ tracking check: SKIPPED (no git work tree, or git unavailable)"
+} elseif ($untrackedShipped.Count -gt 0) {
+  Write-Host ("::error::scripts shipped but not tracked by git (CI will not have them): " + ($untrackedShipped -join ', '))
+  Write-Host "[error] a local-only script would be packaged here but is absent on the runner:"
+  $untrackedShipped | ForEach-Object { Write-Host "   - $_" }
+  Write-Host "        fix: add the name to `$scriptDrop, or commit the file."
+  exit 1
+} else {
+  Write-Host ("      scripts/ tracking check: all " + $scriptFiles.Count + " shipped files are tracked by git")
+}
+
+# fail-closed: npm leaves duplicate copies behind when an install is interrupted. It renames the
+# package it is about to replace to ".<name>-<8 random chars>" and deletes it afterwards; a crash
+# in between leaves the full copy on disk. On 2026-09-27 the author's node_modules carried 69 of
+# them: 48,456 files / 340 MiB of duplicated packages. They were packaged silently, inflating the
+# zip from 352.7 MB to 454.7 MB and making the local package differ from the CI one by 48,525
+# entries -- visible in no log line at all, only in a hand-diff of the two archives.
+# The pattern is npm-specific, and it has to be tight: the author's node_modules also contains
+# genuine dotted files such as node_modules/jszip/.jekyll-metadata, and a first version of this
+# check flagged exactly that -- a false alarm, which is how guards end up being switched off.
+# Two independent conditions, both of which must hold:
+#   1. npm only ever renames a package INTO ITS OWN PARENT, i.e. node_modules/, node_modules/.bin/
+#      or a scope directory node_modules/@scope/. Never inside a package, never deeper.
+#   2. the trailing token npm appends is 8 random base64-ish chars and in practice always mixes
+#      case and digits ("Gra2BtSh", "ufHTURG0"). ".jekyll-metadata" fails this: all lowercase.
+# Depth 1 covers the plain packages, the scoped ones and the files inside node_modules/.bin.
+$nmRoot = Join-Path $root 'node_modules'
+$npmTemp = @()
+if (Test-Path -LiteralPath $nmRoot) {
+  $npmTemp = @(Get-ChildItem -LiteralPath $nmRoot -Force -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+    Where-Object {
+      $rel = ($_.FullName.Substring($root.Length + 1) -replace '\\', '/')
+      $seg = $rel.Split('/')
+      if ($seg.Length -lt 2) { return $false }
+      $parentRel = ($seg[0..($seg.Length - 2)] -join '/')
+      $parentIsNpmSlot = ($parentRel -eq 'node_modules') -or ($parentRel -eq 'node_modules/.bin') -or ($parentRel -match '^node_modules/@[^/]+$')
+      $m = [regex]::Match($_.Name, '^\..*-([A-Za-z0-9]{8})$')
+      $parentIsNpmSlot -and $m.Success -and ($m.Groups[1].Value -cmatch '[A-Z]') -and ($m.Groups[1].Value -match '[0-9]')
+    } |
+    ForEach-Object { ($_.FullName.Substring($root.Length + 1) -replace '\\', '/') } |
+    Sort-Object)
+}
+if ($npmTemp) {
+  Write-Host ("::error::node_modules holds npm temp leftovers from an interrupted install: " + (($npmTemp | Select-Object -First 10) -join ', '))
+  Write-Host "[error] these duplicate packages would be shipped; remove them (or run a clean install):"
+  $npmTemp | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+} else {
+  Write-Host "      node_modules: 0 npm temp leftovers"
+}
+
+# -- node_modules: ship the dependency CLOSURE, not the whole tree (2026-10-12) ----
+# Measured before this change: node_modules held 501 top-level entries / 1025 MB, and the
+# artifact carried all of it. Only 200 entries are reachable from the shipped code, so 302
+# entries / 710 MB -- the entire `src/` React development stack and its transitive tree --
+# went to every recipient for nothing. The delivered app serves public/console.html (Tauri's
+# frontendDist is ../public) and src/ is in $forbidden, so nothing in the archive imports
+# tdesign-react / mermaid / cherry-markdown / vite.
+#
+# The ship set is COMPUTED, never hand-listed, because a hand list rots silently:
+#   roots   = every external package the SHIPPED code imports (scanned by nm_shipset.mjs)
+#           + packages invoked by path (tsx -- see that file's EXTRA_ROOTS)
+#   closure = roots + their transitive dependencies/optionalDependencies
+# A hand list drafted from the same scan missed `ws` (imported by browserHealth.ts at
+# runtime, so every recipient's CDP health check would have died), plus date-fns, rxjs,
+# katex, jsdom and @codemirror.
+#
+# All four failure modes are fail-closed (nm_shipset.mjs owns the first three):
+#   1. the scan looks vacuous (found nothing) -> exit 2, instead of shipping an empty tree
+#   2. shipped PRODUCT code imports a package that is not installed -> exit 3
+#   3. an EXTRA_ROOTS entry is not installed -> exit 3
+#   4. here: the emitted ship set is implausibly small, or the helper/exe is missing -> exit 1
+$nmShip = $null
+$nmHelper = Join-Path $root 'scripts\nm_shipset.mjs'
+if (-not (Test-Path $nmHelper)) {
+  Write-Host "::error::scripts/nm_shipset.mjs is missing -- cannot compute the node_modules ship set"
+  Write-Host "[error] missing scripts/nm_shipset.mjs"
+  exit 1
+}
+# Prefer the bundled runtime (always present in this repo); fall back to PATH for a
+# stripped checkout. The helper only reads JSON from node_modules, so either node works.
+$nmNode = Join-Path $root 'node\node.exe'
+if (-not (Test-Path $nmNode)) {
+  $nmCmd = Get-Command node -ErrorAction SilentlyContinue
+  if ($nmCmd) { $nmNode = $nmCmd.Source } else {
+    Write-Host "::error::no node runtime found (looked for node/node.exe and 'node' on PATH)"
+    Write-Host "[error] no node runtime found"
+    exit 1
+  }
+}
+$nmJson = Join-Path ([System.IO.Path]::GetTempPath()) ("nm_shipset_" + [guid]::NewGuid().ToString('N') + ".json")
+# Base mode splits the two roots: the helper SCANS $srcRoot (the generated tree, whose
+# core files are import-less stubs, so its specifier set is a subset of the full tree's)
+# but RESOLVES against this repo's node_modules -- _public has none of its own, and
+# resolving against a missing directory would report every import as absent.
+if ($Edition -eq 'base') {
+  & $nmNode $nmHelper --root $srcRoot --nm (Join-Path $root 'node_modules') --out $nmJson
+} else {
+  & $nmNode $nmHelper --out $nmJson
+}
+if ($LASTEXITCODE -ne 0) {
+  Write-Host ("::error::nm_shipset.mjs exit " + $LASTEXITCODE + " -- refusing to pack (see its message above)")
+  Write-Host ("[error] nm_shipset.mjs failed with code " + $LASTEXITCODE)
+  exit 1
+}
+if (-not (Test-Path $nmJson)) {
+  Write-Host "::error::nm_shipset.mjs reported success but wrote no JSON"
+  Write-Host "[error] nm_shipset produced no output"
+  exit 1
+}
+# -Encoding UTF8 is explicit on purpose: PowerShell 5.1's Get-Content falls back to the ANSI
+# code page (GBK here) for a BOM-less file, and GBK is double-byte, so a CJK trailing byte
+# pairs up with the FOLLOWING byte. The report carries `root` (the checkout path, which holds
+# the author's CJK account name), so the decoded string is mojibake and -- depending on where
+# the backslashes land relative to the CJK run -- can lose a backslash outright. Naming the
+# encoding removes the reader's default from the equation; the helper also escapes non-ASCII.
+#
+# The failure MODES are kept apart on purpose (2026-10-12). The first run of this block died
+# with a bare "could not be parsed", which is undiagnosable: an I/O error and genuinely
+# malformed JSON look identical, and the first one is transient -- a freshly written temp file
+# can be briefly held by the AV scanner or the search indexer. An identical rerun four minutes
+# later was green. So: retry the read, then report WHICH mode failed.
+$nmRaw = $null
+$nmReadErr = ''
+for ($i = 0; $i -lt 3; $i++) {
+  try { $nmRaw = Get-Content $nmJson -Raw -Encoding UTF8; $nmReadErr = ''; break }
+  catch { $nmReadErr = $_.Exception.GetType().Name; Start-Sleep -Milliseconds 250 }
+}
+$nmShip = $null
+$nmParseErr = ''
+if ($null -ne $nmRaw) {
+  try { $nmShip = $nmRaw | ConvertFrom-Json }
+  catch { $nmParseErr = $_.Exception.GetType().Name }
+}
+Remove-Item $nmJson -Force -ErrorAction SilentlyContinue
+if (-not $nmShip -or -not $nmShip.entries) {
+  # Report the length so "empty file" and "malformed JSON" are distinguishable; a bare
+  # "could not be parsed" sends the reader hunting in the wrong direction.
+  $nmLen = 0
+  if ($null -ne $nmRaw) { $nmLen = $nmRaw.Length }
+  $nmWhy = 'empty output'
+  if ($nmReadErr) { $nmWhy = 'read failed: ' + $nmReadErr }
+  elseif ($nmParseErr) { $nmWhy = 'json parse failed: ' + $nmParseErr }
+  elseif ($nmLen -gt 0) { $nmWhy = 'json parsed but carried no entries' }
+  Write-Host ("::error::nm_shipset output unusable (chars: " + $nmLen + "; " + $nmWhy + ")")
+  Write-Host ("[error] unusable nm_shipset output (chars: " + $nmLen + "; " + $nmWhy + ")")
+  exit 1
+}
+$nmEntries = @($nmShip.entries)
+if ($nmEntries.Count -lt 50) {
+  Write-Host ("::error::node_modules ship set has only " + $nmEntries.Count + " entries -- refusing to pack")
+  Write-Host ("[error] implausibly small node_modules ship set (" + $nmEntries.Count + ")")
+  exit 1
+}
+# Imported-but-undeclared roots: they resolve today only because some dependency hoists them
+# (measured 2026-10-12: nodemailer <- imapflow, ws <- playwright-core). Warn loudly; the
+# closure still ships them, so this is a maintenance signal, not a build failure.
+foreach ($u in @($nmShip.warnings.undeclaredRoots)) {
+  Write-Host ("      [warn] " + $u + ": imported by shipped code but NOT declared in package.json")
+}
+foreach ($u in @($nmShip.warnings.unresolvedScriptOnly)) {
+  Write-Host ("      [warn] not installed (scripts/ only): " + $u)
+}
+Write-Host ("      node_modules: " + $nmEntries.Count + " entries shipped (" + $nmShip.stats.shipDiskMB + " MB, " + $nmShip.stats.shipDiskFiles + " files), " + $nmShip.stats.droppedEntryCount + " dropped (" + $nmShip.stats.droppedDiskMB + " MB)")
+
+$items = @()
+$items += $dirs      | Where-Object { Test-Path (Join-Path $srcRoot $_) }
+$items += $splitDirs | Where-Object { Test-Path (Join-Path $srcRoot $_) }
+$items += $files     | Where-Object { Test-Path (Join-Path $srcRoot $_) }
+$items += $scripts
+$items += 'scripts'
+
+Write-Host "[1/2] packaging $($items.Count) top-level items ..."
+Write-Host ("      dirs: " + (($items | Where-Object { $dirs -contains $_ }) -join ', '))
+Write-Host ("      split(minus *.js, *.d.ts): " + (($items | Where-Object { $splitDirs -contains $_ }) -join ', '))
+Write-Host ("      files: " + (($items | Where-Object { $files -contains $_ }) -join ', '))
+Write-Host ("      root launchers: " + ($scripts -join ', '))
+Write-Host ("      scripts/ : " + $scriptFiles.Count + " files shipped, " + $effectiveDrop.Count + " dev-only dropped (" + ($effectiveDrop -join ', ') + ")")
+if ($Edition -eq 'base') {
+  # In base mode the archive is assembled from TWO roots: everything except node/ and
+  # node_modules/ comes from the generated tree; the bundled node runtime and the computed
+  # dependency closure come from THIS repo (same binaries, same install -- the generated
+  # tree deliberately has neither). -C is absolute on purpose: bsdtar's chdir against a
+  # relative path mis-resolves once an earlier -C has already moved it (measured).
+  Write-Host "      base edition: node/ + node_modules closure sourced from this repo"
+}
+
+# NOTE: the old zip is deleted just before tar runs (below), NOT here. Deleting early
+# meant that a failed validation left the user with no artifact at all -- noticed on
+# 2026-09-26 when the reference guard aborted after this point and the desktop zip was
+# already gone.
+
+# Expand server/ and shared/ into their files (minus tsc artifacts); every member is then
+# passed to tar as an argument. Using args (rather than a -T list file) is deliberate: a
+# list file adds a second encoding hop (the file itself) on top of the argv encoding, and
+# args cost nothing. Keep it that way.
+# "tsc artifacts" means BOTH .js and .d.ts. The filter only excluded .js until 2026-09-27,
+# while this very comment claimed otherwise -- and the .d.ts files turned out to be the last
+# remaining source of "the local package is not the CI package". Measured: two CI builds of
+# the same source (differing only in pack.ps1, which is not shipped) produced DIFFERENT .d.ts
+# sets -- one shipped server/services/resume.d.ts, the next shipped
+# server/services/skillsDict.d.ts instead. So .d.ts made the artifact non-reproducible, on top
+# of being useless at runtime (the package executes .ts through tsx; nothing reads .d.ts).
+# .gitignore already treats server|shared/**/*.d.ts as generated output, not source.
+# CORRECTION (2026-09-26, measured): an earlier version of this comment claimed
+# "scripts/ and node_modules/ still hold many non-ASCII paths". That is false -- the whole
+# shipped set is 100% ASCII (0 non-ASCII paths out of 173080 files across node/,
+# node_modules/, public/, server/, shared/, scripts/, verified by a full walk; the archive
+# listing is likewise 0 bytes >127 across all 181290 entries). The argument therefore
+# stands on robustness, NOT on "there are CJK names today". See the ASCII-only guard below,
+# which now enforces that property instead of leaving it to luck.
+# Members are built as THREE lists (head / node_modules / tail) rather than one. Full
+# edition concatenates them in the historical order -- dirs, node_modules, split, files,
+# launchers, scripts -- so its archive stays byte-identical. Base edition feeds them to
+# tar under different -C roots (see the tar call below).
+$headMembers = New-Object System.Collections.Generic.List[string]
+$nmMembers   = New-Object System.Collections.Generic.List[string]
+$tailMembers = New-Object System.Collections.Generic.List[string]
+foreach ($d in $dirs) { if (Test-Path (Join-Path $srcRoot $d)) { $headMembers.Add($d) } }
+# node_modules is enumerated per top-level entry from the computed ship set (see the
+# "dependency CLOSURE" block above). Scoped entries arrive as `@scope/name`, so a scope
+# directory we ship nothing from never becomes a member.
+# [!] Do NOT also pass the bare directory name: `tar -c node_modules` recurses and archives
+# all 501 entries, silently undoing the prune. The archive-level absence assertion below
+# turns that mistake into a build failure instead of 710 MB of dead weight in every download.
+foreach ($e in $nmEntries) { $nmMembers.Add('node_modules/' + $e) }
+foreach ($d in $splitDirs) {
+  $base = Join-Path $srcRoot $d
+  if (Test-Path $base) {
+    Get-ChildItem $base -Recurse -File -Force |
+      Where-Object { $_.Extension -ne '.js' -and $_.Name -notlike '*.d.ts' } |
+      ForEach-Object { $tailMembers.Add(($_.FullName.Substring($srcRoot.Length + 1) -replace '\\', '/')) }
+  }
+}
+foreach ($f in $files)   { if (Test-Path (Join-Path $srcRoot $f)) { $tailMembers.Add($f) } }
+foreach ($s in $scripts) { $tailMembers.Add($s) }
+# scripts/ is enumerated file-by-file so the dev-only drop list is actually enforced.
+# [!] Do NOT also pass the bare directory name: `tar -c scripts` recurses and archives
+# everything inside it, silently undoing the enumeration (2026-09-26: the archive-level
+# assertion below caught exactly that). Passing the file paths alone is enough -- tar
+# creates the parent entry implicitly.
+foreach ($sf in $scriptFiles) {
+  $tailMembers.Add(($sf.FullName.Substring($srcRoot.Length + 1) -replace '\\', '/'))
+}
+# The combined list every guard below works on (guards do not care which tar root a
+# member physically comes from).
+$members = New-Object System.Collections.Generic.List[string]
+foreach ($m in $headMembers) { $members.Add($m) }
+foreach ($m in $nmMembers)   { $members.Add($m) }
+foreach ($m in $tailMembers) { $members.Add($m) }
+
+# -- REFERENCE GUARD (runs BEFORE tar, so a bad drop costs 3s instead of 5min) --
+# The safety net for pruning: if a file that WILL be shipped (server code, the console,
+# the manual, a launcher, or another shipped script) mentions `scripts/<name>`, then that
+# script must be in the archive. This is what makes "drop by kind" safe -- a drop that
+# removes something still in use fails the build instead of shipping a dead reference.
+# History: this guard immediately found two dangling references that had been sitting in
+# shipped code (`scripts/ensure_chrome.sh` -- the file is at the repo root, so the console's
+# offline hint was telling users to run a path that does not exist).
+$refFiles = New-Object System.Collections.Generic.List[string]
+foreach ($d in @('server', 'shared')) {
+  $p = Join-Path $srcRoot $d
+  if (Test-Path $p) {
+    Get-ChildItem $p -Recurse -File -Force |
+      Where-Object { $_.Extension -in @('.ts', '.html') -and $_.Name -notlike '*.d.ts' } |
+      ForEach-Object { $refFiles.Add($_.FullName) }
+  }
+}
+$pub = Join-Path $srcRoot 'public'
+if (Test-Path $pub) {
+  Get-ChildItem $pub -Recurse -File -Force -Filter *.html | ForEach-Object { $refFiles.Add($_.FullName) }
+}
+foreach ($f in @('README.md', 'DEVELOPMENT.md', 'LOGIN_GUIDE.md')) {
+  $p = Join-Path $srcRoot $f
+  if (Test-Path $p) { $refFiles.Add($p) }
+}
+foreach ($s in $scripts) { $refFiles.Add((Join-Path $srcRoot $s)) }
+foreach ($sf in $scriptFiles) { $refFiles.Add($sf.FullName) }
+
+$refs = New-Object System.Collections.Generic.List[string]
+foreach ($f in $refFiles) {
+  $txt = Get-Content -LiteralPath $f -Raw
+  foreach ($m in [regex]::Matches($txt, 'scripts/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+')) {
+    if (-not $refs.Contains($m.Value)) { $refs.Add($m.Value) }
+  }
+}
+# only enforce for paths that exist in the repo: a typo pointing at nothing is a doc bug,
+# not something the drop list caused -- but it must not be silently ignored either, so it
+# is reported as an error too (that is how the ensure_chrome.sh hint was caught).
+# 2026-09-27: this guard ALSO catches references to files that are gitignored on purpose
+# (scripts/*probe*.ts and friends exist only on the author's disk, so the author's pack is
+# green while the runner's fails -- the same local-green/CI-red shape as the stale-drop
+# check above). The message says "fix the path", but the right fix is usually to drop the
+# `scripts/` prefix from a source comment so it reads as prose rather than as a shippable
+# path. References from docs/ are fine: docs/ is not in the ship set, so it is not scanned.
+$missingOnDisk = @($refs | Where-Object { -not (Test-Path (Join-Path $srcRoot $_)) })
+if ($missingOnDisk) {
+  Write-Host ("::error::shipped files reference scripts that do not exist: " + (($missingOnDisk | Select-Object -First 10) -join ', '))
+  Write-Host "[error] dangling references (fix the path in the referencing file):"
+  $missingOnDisk | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+$notShipped = @($refs | Where-Object { $members -notcontains $_ })
+if ($notShipped) {
+  Write-Host ("::error::referenced scripts are excluded by the drop list: " + (($notShipped | Select-Object -First 10) -join ', '))
+  Write-Host "[error] these are referenced by shipped files but would not be packaged:"
+  $notShipped | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+
+# -- ASCII-only guard, shipping set (2026-09-26) -------------------------------
+# A CJK filename inside a zip is stored as GBK bytes WITHOUT the UTF-8 flag, so an
+# English Windows extracts it as mojibake and the recipient cannot even tell which file
+# to double-click. That is exactly why the desktop-entry helper was renamed to ASCII.
+# Measured 2026-09-26: the packaged archive is 100% ASCII (all 181290 entries; 0 bytes
+# >127 in the whole `tar -tf` listing) and the shipped directories hold 0 non-ASCII
+# paths out of 173080 files. That property is load-bearing, not cosmetic: `tar -tf`
+# output is decoded with the console codepage (gb2312 on a zh-CN box, possibly UTF-8 on
+# a runner), so a non-ASCII entry can decode to U+FFFD or simply compare unequal and
+# silently defeat BOTH the $must pins and the $shippedDev basename compare -- the very
+# assertion that failed v1.0.1. Assert it instead of assuming it.
+# Runs BEFORE tar: a CJK launcher costs 3s here instead of 5min. This half covers the
+# root launchers, $files, and the file-enumerated server/ + shared/ + scripts/.
+# The wholesale dirs (node/, node_modules/, public/) are NOT in $members -- tar recurses
+# into them itself, so they are covered by the archive-level twin below.
+$nonAsciiMembers = @($members | Where-Object { $_ -match '[^\x00-\x7F]' })
+if ($nonAsciiMembers) {
+  Write-Host ("::error::ship set contains non-ASCII names: " + (($nonAsciiMembers | Select-Object -First 10) -join ', '))
+  Write-Host "[error] these would ship with a name that extracts as mojibake on an English Windows:"
+  $nonAsciiMembers | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+
+# -- PORTABILITY GUARD, author identity (2026-09-26) ---------------------------
+# Bug class: a path that only works on the machine that wrote it. Four of them were
+# found in the ship set on 2026-09-26 -- ensure_chrome.sh and scripts/start_cdp_chrome.sh
+# hardcoded the author's Chrome path, and three ts one-shots (apply_boss / batch_apply /
+# batch_multi) hardcoded ROOT to the author's repo path. All four work perfectly on the
+# author's box, so none of them is caught by tsc / selftest / contract tests / smoke --
+# they only break at runtime, on a recipient's machine.
+# Matching the generic shape `X:/Users/...` was tried first and REJECTED: it also flags
+# a legitimate comment that documents the old bug using a placeholder
+# (server/services/localEnv.ts writes `C:/Users/<author>/AppData/...`). Guessing at
+# shapes produces false alarms that get the guard disabled. So assert the concrete
+# thing instead: the packing user's own account name and the absolute path of this
+# checkout must not appear in any shipped text file. Whoever runs pack.ps1 IS the
+# author, so $env:USERNAME / $srcRoot / $root is exactly the identity to look for, and
+# the check stays correct when someone else packs the project. (Base edition adds
+# $srcRoot explicitly: the shipped files then live under _public, so that absolute path
+# is the one that could leak -- in full mode $srcRoot and $root are the same string.)
+# A 3-char floor keeps very short account names from matching ordinary prose; it also
+# means a 1-2 char account name is not caught by the name check (acceptable: rare, and
+# the $srcRoot/$root forms still catch any packaged absolute path).
+# Runs BEFORE tar: ~2s over ~350 files, versus a 5min pack plus a bug report.
+$textExt = @('.ts', '.js', '.mjs', '.cjs', '.json', '.md', '.html', '.htm', '.css',
+             '.sh', '.bat', '.cmd', '.ps1', '.txt', '.yml', '.yaml', '.example')
+$identities = @($env:USERNAME, $srcRoot, ($srcRoot -replace '\\', '/'), $root, ($root -replace '\\', '/')) |
+  Where-Object { $_ -and $_.Length -ge 3 }
+$scanSet = @($members | Where-Object {
+  -not $_.StartsWith('node_modules/') -and -not $_.StartsWith('node/') -and
+  $textExt -contains ([System.IO.Path]::GetExtension($_).ToLower())
+})
+$identityLeaks = New-Object System.Collections.Generic.List[string]
+foreach ($rel in $scanSet) {
+  $full = Join-Path $srcRoot $rel
+  if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+  $txt = ''
+  try { $txt = [System.IO.File]::ReadAllText($full) } catch { continue }
+  foreach ($id in $identities) {
+    if ($txt.IndexOf($id, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      $identityLeaks.Add($rel + '  <- contains "' + $id + '"')
+      break
+    }
+  }
+}
+if ($identityLeaks.Count -gt 0) {
+  Write-Host ("::error::shipped files leak the author's machine identity: " + (($identityLeaks | Select-Object -First 10) -join ' | '))
+  Write-Host "[error] these work only on the machine that packed them:"
+  $identityLeaks | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+Write-Host ("      portability: " + $scanSet.Count + " shipped text files scanned, 0 author-identity leaks")
+
+# -- PII GUARD, resume owner name / phone (2026-09-27) -------------------------
+# Bug class: the resume owner's REAL name and mobile number had leaked into 17 tracked
+# files, including shipped runtime code -- server/services/apply/job51.ts used the name
+# as the resume-picker key inside a page-injected script. Every recipient of the
+# portable zip therefore received a stranger's name and phone number, and the public
+# repo published them. Nothing in tsc / selftest / contract / smoke noticed, because a
+# person's name in a comment or an injected string is syntactically perfect.
+# The tokens are read from data/.pii_denylist.txt: data/ is gitignored AND excluded from
+# the package, so this guard never bakes the very strings it looks for into the repo.
+# Present => fail closed. Absent => skipped, same posture as the scripts/-tracking check.
+#
+# The skip is the dangerous half. data/ is gitignored, so on CI this file NEVER exists --
+# which means the guard that exists to protect the artifact was silently inert in the one
+# place the public artifact is built (found 2026-09-27, by reading the runner's own log:
+# "PII check: SKIPPED"). A skipped guard that prints one calm line is indistinguishable
+# from a guard that passed, which is the recurring failure mode of this project.
+# Fix: the workflow materialises the denylist from the PII_DENYLIST repo secret and sets
+# REQUIRE_PII_SCAN=1. With that flag set, a missing denylist is fatal instead of silent --
+# so the check can only be skipped on a machine where no artifact is being published.
+# Kept pure ASCII on purpose: a contract test asserts this file has 0 non-ASCII bytes.
+$piiFile = Join-Path $root 'data/.pii_denylist.txt'
+$piiRequired = ($env:REQUIRE_PII_SCAN -eq '1')
+if (-not (Test-Path -LiteralPath $piiFile -PathType Leaf)) {
+  if ($piiRequired) {
+    Write-Host "::error::REQUIRE_PII_SCAN=1 but data/.pii_denylist.txt is absent -- refusing to build an unscanned package"
+    Write-Host "[error] the PII guard cannot run, so this artifact would ship unchecked."
+    Write-Host "[error] fix: set the PII_DENYLIST repository secret (one deny token per line)."
+    exit 1
+  }
+  Write-Host "      PII check: SKIPPED (data/.pii_denylist.txt not present)"
+  Write-Host "      [warn] the package about to be built was NOT scanned for personal data."
+} else {
+  $piiTokens = @()
+  foreach ($line in [System.IO.File]::ReadAllLines($piiFile)) {
+    $t = $line.Trim()
+    if (-not $t) { continue }
+    if ($t.StartsWith('#')) { continue }
+    $piiTokens += $t
+  }
+  $piiHits = New-Object System.Collections.Generic.List[string]
+  foreach ($rel in $scanSet) {
+    $full = Join-Path $srcRoot $rel
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+    $txt = ''
+    try { $txt = [System.IO.File]::ReadAllText($full) } catch { continue }
+    foreach ($t in $piiTokens) {
+      if ($txt.IndexOf($t, [System.StringComparison]::Ordinal) -ge 0) {
+        $piiHits.Add($rel + '  <- contains a deny token')
+        break
+      }
+    }
+  }
+  if ($piiHits.Count -gt 0) {
+    Write-Host ("::error::shipped files contain personal data listed in data/.pii_denylist.txt: " + (($piiHits | Select-Object -First 10) -join ' | '))
+    Write-Host "[error] replace it with a placeholder (e.g. 'Zhang San' / '13800138000'):"
+    $piiHits | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+    exit 1
+  }
+  Write-Host ("      PII check: " + $scanSet.Count + " shipped text files scanned against " + $piiTokens.Count + " deny token(s), 0 hits")
+}
+
+# All validations passed -- now (and only now) it is safe to replace the previous zip.
+if (Test-Path $zip) {
+  try { Remove-Item $zip -Force -ErrorAction Stop }
+  catch { Write-Host "[warn] could not delete old zip; tar will overwrite it" }
+}
+
+if ($Edition -eq 'base') {
+  # Base edition: tree members from the generated tree; the node_modules closure and the
+  # node/ runtime from this repo. 'node' is force-sourced from this repo even if a copy
+  # ever appears inside _public -- one runtime, one place. -C paths are absolute (bsdtar
+  # mis-resolves a relative -C once an earlier -C has moved it; measured 2026-10-12).
+  $treeMembers = New-Object System.Collections.Generic.List[string]
+  foreach ($m in $headMembers) { if ($m -ne 'node') { $treeMembers.Add($m) } }
+  foreach ($m in $tailMembers) { $treeMembers.Add($m) }
+  & $tar -a -c -f $zip -C $srcRoot @treeMembers -C $root @nmMembers -C $root node
+  if ($LASTEXITCODE -ne 0) { Write-Host "::error::tar failed with exit code $LASTEXITCODE (zip=$zip)"; Write-Host "[error] tar failed with code $LASTEXITCODE"; exit 1 }
+} else {
+  & $tar -a -c -f $zip -C $root @members
+  if ($LASTEXITCODE -ne 0) { Write-Host "::error::tar failed with exit code $LASTEXITCODE (zip=$zip)"; Write-Host "[error] tar failed with code $LASTEXITCODE"; exit 1 }
+}
+
+# -- VERIFY the archive before declaring success -------------------------------
+Write-Host "[2/2] verifying archive ..."
+$listing = & $tar -tf $zip
+$must = @(
+  "node/node.exe",
+  "node_modules/tsx/dist/cli.mjs",
+  "node_modules/better-sqlite3/package.json",
+  "node_modules/@napi-rs/canvas/package.json",
+  # Runtime-critical node_modules entries, pinned 2026-10-12 when node_modules stopped
+  # being archived wholesale. Before that, "wholesale" made every one of these free -- a
+  # missing entry was impossible by construction. Now the ship set is computed, so the
+  # computed result needs a floor that does not depend on the computation being right.
+  # Only entries that would break a FEATURE if absent are pinned:
+  "node_modules/express/package.json",
+  "node_modules/playwright/package.json",
+  "node_modules/playwright-core/package.json",
+  "node_modules/pdf-parse/package.json",
+  # pdfjs-dist is a transitive dependency of pdf-parse -- and the reason the ship set can
+  # never be derived from "which packages are imported directly".
+  "node_modules/pdfjs-dist/package.json",
+  "node_modules/imapflow/package.json",
+  "node_modules/mammoth/package.json",
+  "node_modules/uuid/package.json",
+  "node_modules/ws/package.json",
+  "node_modules/nodemailer/package.json",
+  # 148 MB of this package is cli/, which server/index.ts reaches through a static import
+  # (the SDK spawns its own CLI). package.json alone is cheap to pin; the bulk of cli/ is
+  # covered by the .js-count assertion further down.
+  "node_modules/@tencent-ai/agent-sdk/package.json",
+  "node_modules/@tencent-ai/agent-sdk/cli/package.json",
+  "public/console.html",
+  # In-product manual, pinned 2026-09-30. public/guide/ is the ONLY manual a recipient
+  # ever gets: the release notes are read once, at download time, while this page is
+  # what they re-read later ("which checkbox stops real applications?"). It ships only
+  # because `public` happens to be archived as a whole directory in $dirs -- so the day
+  # public/ is switched to file-by-file enumeration (the way server/ and shared/ are),
+  # the manual disappears from the artifact with every gate still green: a missing html
+  # file breaks no assertion by construction.
+  # Only PRESENCE is pinned here. Reachability (the server mounts public/ as CONSOLE_DIR,
+  # so GET /guide/ returns this file) is asserted twice and independently: in
+  # scripts/guide_check.ts and in scripts/contract_tests.ts.
+  "public/guide/index.html",
+  "server/index.ts",
+  "server/services/platformPorts.ts",
+  "shared/agentPrompt.ts",
+  "package.json",
+  "version.json",
+  "setenv.bat",
+  "start_all.bat",
+  "start_server.bat",
+  "start_platforms.bat",
+  # First-run install guide (added to $must 2026-09-28). start_all.bat does
+  # `call "%~dp0install_first_run.bat"`, and that script IS the whole implementation of
+  # "unzip, then get an Install button". It used to be absent from this list, shipping
+  # only thanks to "all root .bat files minus $dropScripts" -- so blacklisting or
+  # renaming it would keep every gate green while the recipient's Install button
+  # never appears (the only trace being a lib.rs log line saying "script missing").
+  # Presence is pinned here; the reference itself is pinned by the launcher
+  # cross-reference guard below. Both are needed.
+  "install_first_run.bat",
+  # Pinned as of 2026-09-26. The desktop-entry helper is ASCII now, and that is what
+  # makes this assertion possible at all: tar -tf output is decoded with the console
+  # codepage, so a CJK-named entry could not be compared reliably (see the note above
+  # the $shippedDev check). Renaming it closed that blind spot.
+  "create_desktop_shortcut.bat",
+  # Native shell (2026-09-27). The exe and its WebView2Loader.dll are the entry the
+  # desktop shortcut prefers; BUILD_INFO.json carries the provenance stamp the guard
+  # above verifies. All three must be in the zip or "double-click and run" is dead.
+  "dist-app/offer-where.exe",
+  "dist-app/WebView2Loader.dll",
+  "dist-app/BUILD_INFO.json",
+  # scripts/ is now file-enumerated (see $scriptDrop), so pin the ones that must always
+  # be there: the single script the server spawns at runtime, the shared CDP helper, and
+  # a representative collector. Without these the app starts but one core feature is dead.
+  "scripts/ocr_wechat_jd.ts",
+  "scripts/lib/browser.ts",
+  "scripts/lib/apiAuth.ts",
+  "scripts/collect_boss.ts"
+)
+$missing = $must | Where-Object { $listing -notcontains $_ }
+if ($missing) {
+  Write-Host ("::error::archive incomplete, missing: " + (($missing | Select-Object -First 10) -join ', '))
+  Write-Host "[error] archive is incomplete, missing:"
+  $missing | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+# -- ROOT LAUNCHER CROSS-REFERENCE GUARD (2026-09-28) --------------------------
+# Why this exists: $must can only pin "this file must be in the archive". It cannot pin
+# the REFERENCES between launchers.
+#
+# Three real gaps, all found on 2026-09-28 while checking whether "unzip, then an Install
+# button pops up" was actually achievable:
+#   1) start_all.bat does `call "%~dp0install_first_run.bat"`, but that file was NOT in
+#      $must -- it shipped only because "all root .bat files" minus $dropScripts happened
+#      to include it. Blacklist it (or rename it) and every gate stays green while the
+#      recipient's Install button never appears.
+#   2) create_desktop_shortcut.bat tested the ROOT `%PKG%offer-where.exe`, while the shell
+#      ships at `dist-app\offer-where.exe` (that is what $files/$must deliver). The test was
+#      therefore ALWAYS false: the desktop entry silently fell back to start_all.bat, so the
+#      recipient got the black console + Chrome --app experience and the native shell was
+#      never used once -- with every gate green. This guard turns "wrong path, silent
+#      degradation" into a build failure.
+#   3) install_first_run.bat's reference to create_desktop_shortcut.bat lives inside an
+#      `-EncodedCommand` base64 payload -- plain-text scanning cannot see it. So the
+#      payloads are decoded (UTF-16LE) and scanned as well. base64 is a natural reference
+#      black hole; this closes it.
+#
+# Scope (stated so nobody assumes more): shipped ROOT launchers only, and only references
+# that name a concrete file. `scripts/<name>` style references are covered by the
+# $refs/$danglingInZip guard above. References inside decoded payloads that are not local
+# paths (URLs, registry keys) are out of scope. A payload that fails to decode is skipped
+# AND reported -- never silently ignored.
+$launcherDangling = New-Object System.Collections.Generic.List[string]
+# All three "package root" spellings must be covered: `%~dp0` (own directory), `%PKG%`
+# (used by create_desktop_shortcut / install_first_run), and `%ROOT%` (defined by
+# setenv.bat as `set "ROOT=%~dp0"` and used by start_server.bat to locate
+# node_modules\tsx\dist\cli.mjs). Covering only the first two would miss the third --
+# and `%ROOT%` points at the file whose absence is the most fatal of all.
+$refRootPatterns = @('%~dp0([A-Za-z0-9_\.\-\\/]+)', '%PKG%([A-Za-z0-9_\.\-\\/]+)', '%ROOT%([A-Za-z0-9_\.\-\\/]+)')
+# Bare quoted filenames: used ONLY on decoded payloads (plain text contains echo/help
+# strings that would false-positive).
+$refQuotedPattern = '["'']([A-Za-z0-9_\.\-\\/]+\.(?:bat|cmd|exe|ps1|sh|mjs|cjs|ts|js|json|dll|ico))["'']'
+# Only these extensions count as "naming a concrete file"; anything else (e.g. `%~dp0data`,
+# `%PKG%public`) is a directory and is skipped.
+$refFileExt = '\.(bat|cmd|exe|ps1|sh|mjs|cjs|ts|js|json|dll|ico)$'
+# Comment lines are stripped before scanning. Rationale (learned by hitting it): a comment
+# that DOCUMENTS a past bad path -- e.g. "this used to test the root %PKG%offer-where.exe" --
+# is not a reference, because it is never executed. Scanning it makes the guard fire on its
+# own documentation, and the only way to get green again would be to DELETE the explanation
+# of the bug. That trade is backwards: the explanation is exactly what keeps the bug from
+# coming back. So: strip comments, then scan. Rule is per extension, applied to both the
+# plain-text pass and the decoded-payload pass (a payload is PowerShell, so it uses '#').
+$commentPatterns = @{
+  '.bat' = '^\s*(?:@?rem\b|::)'
+  '.cmd' = '^\s*(?:@?rem\b|::)'
+  '.ps1' = '^\s*#'
+  '.sh'  = '^\s*#'
+}
+function Remove-CommentLines {
+  param([string]$Text, [string]$Ext)
+  $pat = $null
+  if ($commentPatterns.ContainsKey($Ext)) { $pat = $commentPatterns[$Ext] }
+  if (-not $pat) { return $Text }
+  $kept = New-Object System.Collections.Generic.List[string]
+  foreach ($l in ($Text -split "`r?`n")) {
+    if ($l -match $pat) { continue }
+    $kept.Add($l)
+  }
+  return ($kept -join "`n")
+}
+$payloadSeen = 0
+$payloadDecoded = 0
+$scriptExt = ''
+foreach ($ln in $scripts) {
+  $lp = Join-Path $srcRoot $ln
+  if (-not (Test-Path $lp)) { continue }
+  $scriptExt = [System.IO.Path]::GetExtension($ln).ToLower()
+  $raw = Get-Content -LiteralPath $lp -Raw -Encoding UTF8
+  $texts = New-Object System.Collections.Generic.List[string]
+  $texts.Add((Remove-CommentLines -Text $raw -Ext $scriptExt))
+  foreach ($m in [regex]::Matches($raw, '-EncodedCommand\s+([A-Za-z0-9+/=]{40,})')) {
+    $payloadSeen++
+    try {
+      $payload = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($m.Groups[1].Value))
+      $texts.Add((Remove-CommentLines -Text $payload -Ext '.ps1'))
+      $payloadDecoded++
+    } catch {
+      Write-Host ("[warn] " + $ln + ": -EncodedCommand payload could not be decoded; references inside it were NOT checked")
+    }
+  }
+  for ($i = 0; $i -lt $texts.Count; $i++) {
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($pat in $refRootPatterns) {
+      foreach ($m in [regex]::Matches($texts[$i], $pat)) { $names.Add($m.Groups[1].Value) }
+    }
+    if ($i -gt 0) {
+      foreach ($m in [regex]::Matches($texts[$i], $refQuotedPattern)) { $names.Add($m.Groups[1].Value) }
+    }
+    foreach ($n in $names) {
+      # Normalize to the archive's own spelling (forward slashes, no trailing separator);
+      # only references that name a concrete file are checked.
+      $norm = ($n -replace '\\', '/').TrimEnd('/')
+      if ($norm -notmatch $refFileExt) { continue }
+      if ($listing -notcontains $norm) { $launcherDangling.Add(($ln + ' -> ' + $norm)) }
+    }
+  }
+}
+if ($launcherDangling.Count -gt 0) {
+  $uniq = $launcherDangling | Select-Object -Unique
+  Write-Host ("::error::shipped launcher references a file that is not in the archive: " + (($uniq | Select-Object -First 10) -join ', '))
+  Write-Host "[error] root launcher cross-reference check failed:"
+  $uniq | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  Write-Host "      (see the ROOT LAUNCHER CROSS-REFERENCE GUARD note in pack.ps1: a wrong path here"
+  Write-Host "       silently degrades a recipient to .bat, or kills the Install button, with all gates green)"
+  exit 1
+}
+Write-Host ("      launcher cross-refs: " + $scripts.Count + " root launchers, " + $payloadSeen + " encoded payload(s) decoded (" + $payloadDecoded + "), 0 dangling")
+
+# dev/self-use scripts must NOT ship (see $dropScripts for the rationale).
+# NOTE: `tar -tf` output is decoded with the console codepage, so a CJK-named entry might
+# not compare equal in this process. That blind spot is now closed by construction rather
+# than by hand: the ASCII-only guard below asserts the archive holds ZERO non-ASCII entry
+# names, so every name in it -- the CJK legacy packer included -- is in the reliably
+# comparable class. (The packer is also dropped by the Get-ChildItem filter above, which
+# uses real .NET strings; that is the primary defence, this is the belt.)
+# Compare on BASENAME: the rule is "these names never ship, at any path level".
+# An exact-path compare only ever protected the root copy -- which is exactly how
+# v1.0.1 slipped a root `start.bat` into the archive on the runner (the root copy
+# was in fact filtered, so it must have arrived via a packaged directory).
+$shippedDev = $listing | Where-Object { $dropScripts -contains ($_ -replace '^.*/', '') }
+if ($shippedDev) {
+  $names  = ($shippedDev | Select-Object -First 10) -join ', '
+  $atRoot = ($dropScripts | Where-Object { Test-Path (Join-Path $srcRoot $_) }) -join ', '
+  Write-Host ("::error::developer-only scripts shipped: " + $names + " | present at repo root: [" + $atRoot + "]")
+  Write-Host ("      diagnostic: zip=" + $zip + " ; scriptsSelected=" + ($scripts -join ','))
+  Write-Host "[error] archive contains developer-only scripts:"
+  $shippedDev | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+
+# -- scripts/ guards (2026-09-26) ----------------------------------------------
+# (a) no drop target may survive in the archive (the enumeration above is the only
+#     thing enforcing the drop list -- prove it worked instead of assuming).
+$shippedDrops = $listing | Where-Object { $effectiveDrop -contains ($_ -replace '^.*/', '') }
+if ($shippedDrops) {
+  Write-Host ("::error::dropped dev scripts are still in the archive: " + (($shippedDrops | Select-Object -First 10) -join ', '))
+  Write-Host "[error] scripts/ drop list was not enforced:"
+  $shippedDrops | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+# (b) every referenced script must be inside the REAL archive too (the pre-tar guard worked
+#     on the intended member list; this proves tar did not silently skip any of them).
+$danglingInZip = @($refs | Where-Object { $listing -notcontains $_ })
+if ($danglingInZip) {
+  Write-Host ("::error::referenced scripts missing from the archive: " + (($danglingInZip | Select-Object -First 10) -join ', '))
+  Write-Host "[error] these are referenced by shipped files but absent from the zip:"
+  $danglingInZip | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+Write-Host ("      scripts/ verified: " + $scriptFiles.Count + " shipped, " + $effectiveDrop.Count + " dev-only excluded, " + $refs.Count + " referenced paths all present")
+# secrets / personal data must NOT be in there
+# Also: no tsc build output may survive for server/ or shared/ (belt to the argv-filter braces).
+# A .d.ts is generated, gitignored, environment-dependent and useless to the end user; shipping
+# it is what made two consecutive CI builds of the same source differ by one entry.
+# _tools/ added 2026-10-07. It is gitignored (.gitignore:89) and holds one-off debug /
+# alignment tooling -- including _tools/_sweep/data/, a full copy of the real data/
+# directory. That copy carries .github_token and .auth_token right next to chat.db.
+# It cannot reach $members today: it appears in none of $dirs / $splitDirs / $files /
+# $scripts / $scriptFiles, and the only tar call in this file takes @members as argv, so
+# there is no directory walk that could pick it up. This entry therefore changes nothing
+# right now, and that is the point -- it is a belt for the ONE way _tools/ could ever
+# ship: someone adds it to $dirs. The wildcard `-like "data/*"` above does NOT cover it
+# (PowerShell's -like is a whole-string match, so "data/*" requires the path to START
+# with data/; `_tools/_sweep/data/.github_token` does not). Without this line, that one
+# commit would ship a live GitHub PAT to every recipient with all four pre-push gates,
+# npm test, npm run verify and pack.ps1 itself green -- the same failure shape as the
+# 2026-09-27 PII guard, which printed a calm "SKIPPED" on the runner while publishing.
+$forbidden = $listing | Where-Object { $_ -eq ".env" -or $_ -like "data/*" -or $_ -like "_tools/*" -or $_ -like "src/*" -or $_ -like ".git/*" -or $_ -like "server/*.d.ts" -or $_ -like "shared/*.d.ts" }
+if ($forbidden) {
+  Write-Host ("::error::archive contains files that must never be shipped: " + (($forbidden | Select-Object -First 10) -join ', '))
+  Write-Host "[error] archive contains files that must never be shipped:"
+  $forbidden | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+
+# tsc build artifacts (.js) under server/ or shared/ must never ship (tsx runs .ts directly)
+$leftover = $listing | Where-Object { $_ -match '^server/.*\.js$' -or $_ -match '^shared/.*\.js$' }
+if ($leftover) {
+  Write-Host ("::error::archive still contains tsc build artifacts: " + (($leftover | Select-Object -First 10) -join ', '))
+  Write-Host "[error] archive still contains tsc build artifacts (.js under server/ or shared/):"
+  $leftover | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+# -- ASCII-only guard, archive level (2026-09-26) ------------------------------
+# Twin of the pre-tar check: same rationale (see the note above that block), but this
+# one reads the REAL archive listing, so it also covers node/, node_modules/ and
+# public/, which tar recurses into on its own without $members ever seeing them.
+$nonAsciiEntries = @($listing | Where-Object { $_ -match '[^\x00-\x7F]' })
+if ($nonAsciiEntries) {
+  Write-Host ("::error::archive contains non-ASCII entry names: " + (($nonAsciiEntries | Select-Object -First 10) -join ', '))
+  Write-Host "[error] archive contains non-ASCII entry names (they extract as mojibake on an English Windows):"
+  $nonAsciiEntries | Select-Object -First 10 | ForEach-Object { Write-Host "   - $_" }
+  exit 1
+}
+
+# Reverse assertion (A): the SHIPPED part of node_modules must not be damaged -- compare
+# against the on-disk truth *restricted to the computed ship set*, not a guessed threshold
+# and not the whole tree (the whole tree is now deliberately larger than the archive).
+# History: `--exclude=server/*.js` silently dropped 254 dependency files under
+# node_modules/**/server/*.js before this audit caught it.
+$diskNmJs = [int]$nmShip.stats.shipDiskJs
+$zipNmJs  = ($listing | Where-Object { $_ -match '^node_modules/.*\.js$' } | Measure-Object).Count
+if ($zipNmJs -lt $diskNmJs) {
+  Write-Host ("::error::node_modules lost files: zip .js=$zipNmJs but the ship set holds $diskNmJs")
+  Write-Host "[error] node_modules lost files: zip .js=$zipNmJs but ship set .js=$diskNmJs"
+  exit 1
+}
+
+# Reverse assertion (B): the prune must actually have happened.
+# (A) only proves nothing was LOST. An enumeration bug that fell back to archiving the whole
+# directory would leave (A) -- and every other assertion -- green, because a superset is
+# never missing anything. So assert the largest dropped entry is ABSENT from the archive,
+# and first assert that it exists on disk: otherwise the check is vacuous and always passes.
+$nmCheck = $nmShip.verifyAbsent
+$nmDropped = [int]$nmShip.stats.droppedEntryCount
+# Fail closed when the helper dropped entries but named no target to verify: the absence
+# check below is inside an `if`, so a null verifyAbsent would make it a SILENT no-op -- the
+# exact outcome this guard exists to prevent. (The helper returns null only when nothing was
+# dropped at all, which is the one case where an absence check is genuinely vacuous.)
+if (-not ($nmCheck -and $nmCheck.name)) {
+  if ($nmDropped -gt 0) {
+    Write-Host ("::error::nm_shipset dropped " + $nmDropped + " entries but reported no verifyAbsent target -- the absence check would be skipped")
+    Write-Host ("[error] no verifyAbsent target although " + $nmDropped + " entries were dropped")
+    exit 1
+  }
+  Write-Host "      node_modules prune verified: nothing dropped (every installed entry is reachable)"
+} else {
+  if (-not (Test-Path (Join-Path $root ('node_modules/' + $nmCheck.name)))) {
+    Write-Host ("::error::nm_shipset verifyAbsent target is not on disk: " + $nmCheck.name)
+    Write-Host "[error] verifyAbsent target missing -- the absence check would be vacuous"
+    exit 1
+  }
+  $nmLeak = @($listing | Where-Object { $_ -like ('node_modules/' + $nmCheck.name + '/*') })
+  if ($nmLeak.Count -gt 0) {
+    Write-Host ("::error::node_modules prune did not happen: " + $nmCheck.name + " (" + $nmCheck.diskMB + " MB) has " + $nmLeak.Count + " entries in the archive")
+    Write-Host ("[error] a dropped package is still archived: " + $nmCheck.name)
+    $nmLeak | Select-Object -First 5 | ForEach-Object { Write-Host ("   - " + $_) }
+    exit 1
+  }
+  Write-Host ("      node_modules prune verified: " + $nmCheck.name + " (" + $nmCheck.diskMB + " MB) excluded; " + $nmEntries.Count + " entries / " + $zipNmJs + " .js shipped")
+}
+
+$sw.Stop()
+$size = (Get-Item $zip).Length
+Write-Host "  verified: all required files present, no secrets, no personal data"
+Write-Host ("PACKED: " + $zip)
+Write-Host ("  zip " + [math]::Round($size/1MB,1) + " MB | " + $listing.Count + " entries | elapsed " + [math]::Round($sw.Elapsed.TotalSeconds,1) + " s")

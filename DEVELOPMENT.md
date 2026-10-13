@@ -1,0 +1,1622 @@
+# Web Agent 二次开发指南
+
+这是一个基于 CodeBuddy Agent SDK 的完整 Web Agent 应用模板。本指南将帮助你理解项目结构并进行二次开发。
+
+## 目录
+
+- [项目架构](#项目架构)
+- [核心功能](#核心功能)
+- [二次开发指南](#二次开发指南)
+- [API 参考](#api-参考)
+- [常见定制需求](#常见定制需求)
+
+---
+
+## 项目架构
+
+### 技术栈
+
+**后端**
+- Node.js + Express (RESTful API)
+- TypeScript
+- @tencent-ai/agent-sdk (Agent SDK)
+- better-sqlite3 (SQLite 数据库)
+
+**前端**
+- React 18 + TypeScript
+- React Router (路由管理)
+- TDesign React (UI 组件库)
+- Vite (构建工具)
+
+### 目录结构
+
+```
+web-agent/
+├── server/                     # 后端服务
+│   ├── index.ts               # Express 服务器入口
+│   ├── db.ts                  # 数据库操作
+│   └── index.d.ts             # 类型定义
+├── src/                       # 前端源码
+│   ├── components/            # React 组件
+│   │   ├── ChatMessages.tsx   # 消息列表
+│   │   ├── ChatInput.tsx      # 输入框
+│   │   ├── ToolCallsCollapse.tsx  # 工具调用展示
+│   │   ├── PermissionDialog.tsx   # 权限弹窗
+│   │   ├── AgentConfigDialog.tsx  # Agent 配置
+│   │   ├── Sidebar.tsx        # 侧边栏
+│   │   ├── Header.tsx         # 顶部栏
+│   │   └── ...
+│   ├── hooks/                 # 自定义 Hooks
+│   │   ├── useChat.ts         # 聊天逻辑
+│   │   ├── useSessions.ts     # 会话管理
+│   │   ├── useModels.ts       # 模型管理
+│   │   ├── useAgents.ts       # Agent 管理
+│   │   └── useTheme.ts        # 主题管理
+│   ├── pages/                 # 页面
+│   │   └── ChatPage.tsx       # 聊天页面
+│   ├── types.ts               # TypeScript 类型定义
+│   ├── config.ts              # 应用配置
+│   ├── App.tsx                # 应用入口
+│   └── main.tsx               # React 入口
+├── data/                      # 数据存储目录
+│   └── chat.db               # SQLite 数据库
+├── package.json
+├── tsconfig.json
+└── vite.config.ts
+```
+
+### 原生外壳（Tauri，可选）
+
+`dist-app/` 下是**已构建好、并已入库**的原生外壳，也是便携包与桌面入口的首选入口：
+
+| 文件 | 作用 |
+|---|---|
+| `offer-where.exe` | 外壳本体（Tauri v2 + WebView2）。拉起后端与 5 个核心平台调试窗口，用原生窗口加载控制台 |
+| `WebView2Loader.dll` | **必须与 exe 同目录**。读 PE 导入表可知这是它唯一的非系统 DLL，缺了直接起不来 |
+| `BUILD_INFO.json` | 源码哈希戳，见下 |
+
+外壳的边界（刻意为之，**别扩大**）：它只接管 ①控制台窗口 ②Node 后端进程生命周期 ③系统托盘 / 退出清理。
+**投递核心一行不改** —— 仍然是用户本机的真实 Google Chrome + 持久化 profile 走 CDP，反检测与登录态照旧。
+
+启动流程等价于 `start_all.bat`，多了一步「首跑安装引导」：`data/.installed` 不存在时调 `install_first_run.bat`
+弹「安装」对话框（建桌面入口 + 写标记）。`data/` 不进包，所以每个收件人解压后首跑必走一次。
+
+#### 改了 `src-tauri/` 之后必须重建
+
+二进制是入库的 —— 不这样 CI（`release.yml` 跑在 `windows-latest` 上）就取不到它。代价是「改了源码忘了重编」
+成了**静默故障**：tsc / selftest / 合约 / 冒烟四道门**全绿也看不见**，因为这条断言要同时跨越「磁盘上的源码」
+与「exe 里的字节」，没有任何编译器或测试运行器会替你做这件事。
+
+因此仓库根目录的 `build_app.ps1`（**仅源码树提供，不随便携包分发** —— 收件人不构建程序）会把
+`src-tauri/` 下每个源文件的 SHA256 与两个产物的哈希写进 `dist-app/BUILD_INFO.json`；
+`pack.ps1` 打包前重算并比对，**不一致直接 fail-closed**（并列出具体是哪个文件新增/修改/删除）。
+
+```powershell
+# 本机没有 MSVC，只能走 x86_64-pc-windows-gnu（完整工具链配方见 build_app.ps1 头部注释）
+$env:RUSTUP_TOOLCHAIN='stable-x86_64-pc-windows-gnu'
+$env:CARGO_TARGET_DIR='D:\_ow_b10'
+.\build_app.ps1
+```
+
+**然后把 `dist-app/` 三个文件与 `src-tauri/` 的改动放进同一个提交** —— 分开提交必然产生一个
+「源码与二进制对不上」的历史点，而日后 checkout 到那个提交的人无从判断。
+
+#### 排障
+
+外壳把全链路日志追加写到 **exe 同级 `offer-where.log`**：启动参数 / 窗口创建 / 生效的 WebView2 参数及其来源 /
+后端探活 / 窗口关闭与销毁 / 退出请求 / panic。**出问题先看它。**
+WebView2 侧的崩溃转储在 `%LOCALAPPDATA%\com.offerwhere.desktop\EBWebView\Crashpad\reports`。
+
+### NSIS 安装包（OfferWhere-Setup.exe）—— 2026-09-28 起的主推下载
+
+取代了下一节的自解压外壳。`release.yml` 每次发布都构建它，并**真跑一次静默安装**才放行。
+
+**架构**：安装器里内嵌那一个**已经压好**的 `job-apply-agent-portable.zip`，安装时释放到 `%TEMP%`，
+再调用系统自带的 `$SYSDIR\tar.exe` 解到用户选的目录。
+
+```
+[ makensis 生成的安装器 PE：UI + 脚本 + 卸载器，约 3.2MB ][ 原样内嵌的 payload.zip，约 362MB ]
+```
+
+- **为什么不用 Tauri 自带的 NSIS 打包器**：① `src-tauri/tauri.conf.json` 的 `bundle.resources` 是空的
+  ⇒ 它只会打出那个 3.5MB 的外壳（看起来一切正常，装完却没有负载）；② `tauri-bundler` 对**每个文件**
+  各生成一条 NSIS `File` 指令 ⇒ 12.45 万个文件走不通。内嵌一个 zip 是这两个问题的同一个解。
+- **为什么 `SetCompress off`**：payload 本来就是 deflate 压过的 zip，再压一遍实测**几分钟换 ~0%**。
+  代价只有 NSIS 自身开销 + 图标资源（**NSIS 不压缩图标**）：产物 **379,881,684 B** =
+  payload 379,580,025 **+ 301,659**（其中约 184KB 是安装器与卸载器各存一份 `public/app.ico`）。
+  **实测内嵌 362MB 只要 3 秒。** 合约测试钉住「`SetCompress off` 必须在 `File` 之前」——
+  顺序写反就等于把上面这件事白做。
+- **脚本**：`installer/offerwhere.nsi`（**纯 ASCII**；中文界面来自 NSIS 自带的 `SimpChinese.nlf/.nsh`，
+  脚本里写中文会让构建结果取决于编译机的代码页）。
+  **构建**：`./make_nsis.ps1 -Zip <便携包.zip> -Out <exe> -SelfTest`。
+- **首跑不会再有「安装」提示**：安装器自己写 `$INSTDIR\data\.installed` —— 与 `start_all.bat`、
+  `src-tauri/src/lib.rs` 判的是**同一个标记**（也就是 `install_first_run.bat` 那个「安装」按钮写的那个）。
+  理由是那个对话框的成因已经消失：它存在的背景是旧自解压包**只解压、从不碰外壳**，而它做的事只有
+  「跑 `create_desktop_shortcut.bat /silent` + 写标记」两件 —— 安装器两件都做了（还多一个开始菜单项
+  与卸载项）。留着它，用户会在刚点完向导的「安装」之后被要求再点一次「安装」。
+- **安装器自己也有图标了**（2026-09-28 补）：`installer/offerwhere.nsi` 的 `Icon` /
+  **`UninstallIcon`** / `MUI_ICON` / `MUI_UNICON` 四处同指 `public/app.ico`。
+  在此之前，**用户最先看到的那一个文件**（下载栏 / 资源管理器 / SmartScreen 提示框）带的是 NSIS 的默认
+  图标，而桌面快捷方式带的是我们的 —— 同一个产品两套品牌标记。这是拿一份「图标必须出现在所有位置」
+  的发布清单逐条对出来的（exe / 窗口 / 托盘 / favicon / 页内都覆盖了，唯独向导漏了）。
+  **指令名是 `UninstallIcon`，没有 `UnIcon`**（写错只报 `Invalid command: "UnIcon"`，读起来像手误）。
+  自测会把 **exe 里实际嵌入的图标**与源 `.ico` 逐像素比对 —— 只断言 `.nsi` 里写了 `Icon`，
+  「写了但编译器用了默认图标」照样能通过，而那正是它漏了这么久的形态。
+- **`-SelfTest`（本机实测 117–141 s 装到 C:，118 s 装到 D:；同一台机器差 20 秒，别把它当常数）**：用 `/S /D=<临时目录>` 真跑一次静默安装，核对退出码 0 /
+  **124,554 个文件** / 入口、卸载器与首跑标记都在 / **静默安装不许启动 GUI** /
+  `%TEMP%` 不留 `ns*.tmp` **与 `~nsu*.tmp`** / 没碰默认落点。
+  文件数口径可对账：**zip 中央目录 124,552 + 安装器写入的 `Uninstall.exe` + `data\.installed` = 124,554**。
+  然后**真跑一次静默卸载**：等终态（`settle wait` 实测 **87–94 s**，见下）、断言**除 `data\` 之外什么都不剩**、
+  `data\.installed` 还在、卸载项已注销、桌面入口已收回，并把**这次的卷关系**打出来
+  （默认 `$SelfTestDir` 在 `%TEMP%`，与 `$LOCALAPPDATA` **同卷** ⇒ 报告会明说「跨卷路径未被走过」；
+  要真验跨卷：`-SelfTestDir D:\somewhere`）。
+- **🔴 卸载器三条硬约束**（2026-09-28 用 6 组变体 + 120 s 观察窗口定下来）：
+  - **不许用 `Rename` 搬 `data\`**。`Rename` 不能跨卷 ⇒ 装机到别的盘时「保留数据」会**静默变成「删光数据」**
+    （实测 `data KEPT=False`）。而「装到哪个盘」正是我们自己交给用户选的功能。改用**枚举删除**除 `data\` 外的一切。
+  - **卸载器的进程退出 ≠ 卸载完成**。NSIS 先把自己复制到 `%TEMP%\~nsu.tmp` 再重启，**原进程立刻退出**、
+    树还在删（12.4 万文件实测 **87–94 s**）。所以断言必须等终态，清理函数也要对瞬时占用重试 ——
+    否则会稳定报出「卸载器留了树」，而那棵树几十秒后就没了。
+  - 残留要查 **`ns*.tmp` 和 `~nsu*.tmp` 两个族**。只查前者，等于把卸载器自复制的副本当干净。
+- **两个必须记住的坑**：
+  - **`/D=` 必须末位且不带引号**。写成 `/D="D:\x"` 时 NSIS 会**静默忽略**它、装到默认位置，
+    而退出码仍然是 0 —— 看起来完全成功。自测第 1 次就是被这一条抓住的。
+  - **别在 Git Bash 里传这些参数**。MSYS 会把 `/S` 当盘符路径改写成 `S:/`（静默模式静默失效）、
+    把 `/D=` 里的 `:` 当 POSIX 路径表分隔符拆开。要绝对干净就用 Python `subprocess` 传 argv，
+    或加 `MSYS_NO_PATHCONV=1`。**排查「卡住」前先看窗口标题**（`tasklist /V`），别看 CPU。
+- **CI 不赌镜像**：`windows-latest` 会在 Server 2022（预装 NSIS 3.10）与 Server 2025（**没有 NSIS**）
+  之间漂移 ⇒ `release.yml` 先探测四个常见路径、缺了 `choco install nsis`，都没有才失败。
+- **发布说明即产品文案**：`release.yml` 里那段文字就是用户下载时看到的第一段字，每一条都对应安装器里
+  真实存在的东西（目录页 / 开始菜单与桌面入口 / 「应用和功能」卸载项 / `/S`）。**改安装器时要同步改它。**
+- **⚠️ 已知缺口（待定，2026-09-28 发现）：手工 NSIS 不装 WebView2 运行时。**
+  `bundle.windows.webviewInstallMode` 是喂给 **Tauri 自带 bundler** 的配置，而我们绕开了它
+  ⇒ 本安装器只解 payload，**既不检查也不安装 WebView2**。缺运行时的机器（LTSC / Server /
+  未预装的老 Win10）装完点开是**空白窗口** —— 表象与 2026-09-27 那次 GPU 沙箱事故一模一样，
+  成因完全不同（那次见 `docs/tauri-shell-webview2-gpu-2026-09-27.md`）。
+  代价取决于要哪一档：`embedBootstrapper` **≈ +1.8 MB、需联网**；`offlineInstaller` **≈ +127 MB、可离线**。
+  判断运行时在不在的键（x64 实测）：
+  `HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}` 的 `pv`
+  （按用户装法在 `HKCU\...\EdgeUpdate\Clients\{同 GUID}`）。**注意**：不带 `WOW6432Node` 的那条
+  `HKLM\SOFTWARE\Microsoft\EdgeUpdate\...` 在本机**不存在** ⇒ 只查它会得出「没装」的错误结论。
+  **未实施**：需要先决定「允不允许安装时联网」。另外，本机没有装它的必要（已预装），
+  所以这条**没法在本机端到端验证**，得靠一台干净的虚拟机。
+
+### 启动期磁盘清理（2026-09-28 由同步改为真正异步）
+
+> **背景**：`server/services/dataCleanup.ts` 的 `cleanupData` 声明为 `async`，但函数体内
+> **一个 `await` 都没有** —— 里面全是 `readdirSync` / `statSync` / `unlinkSync`。它被**直接写在
+> `app.listen` 回调里**，于是整段同步 I/O 跑在事件循环上，把循环占死到底。
+>
+> **症状**：日志已打「API 服务器已启动」、端口已 `LISTENING`，但**任何请求都得不到响应**；
+> 客户端超时后在服务端留下一排 `CLOSE_WAIT`。看起来像「服务坏了」，其实是「在忙」。
+>
+> **为什么长期没被发现**：① 端口和日志都显示「已就绪」；② 空 `data/` 的 CI 冒烟里它只要几毫秒
+> —— **门禁天然看不见**；③ 代价随 `data/` 规模变化，本机实测 `data/` = 847 MB / 5 351 文件时
+> **同步占用 19 893 ms**（进程内打点测得），而 Windows + Defender 逐文件扫描还会再放大。
+>
+> **修法**（三处）：
+> 1. 全面改用 `fs.promises.readdir / stat / unlink`，并真正 `await`；
+> 2. 遍历用 `readdir(dir, { withFileTypes: true })` 取条目类型 ⇒ **省掉每文件一次 `stat`**；
+> 3. **不跟随目录符号链接** ⇒ 修掉 Windows junction 成环导致指数级展开的隐患。
+>
+> **效果**：模块级隔离测试 `19 893 ms 全程阻塞` → **288 ms 且不阻塞**；
+> `npm test`（58/58 + 405/405）与 `npm run verify` 均回归通过。
+>
+> **验收提醒**：判断「服务起没起」不能只看端口或日志，**必须发一个请求拿到响应**才算数。
+
+### 上一代：自解压安装包（已退出发布链路）
+
+> **状态**：2026-09-28 起 `OfferWhere-Setup.exe` 改由 NSIS 生成（见上一节），本节的 stub **不再是发布资产**。
+> `tools/sfx/` 与 `make_sfx.ps1` 仍留在仓库里，`release.yml` 每次发布仍**从 C 源码编译一次** ——
+> 唯一目的是防止「搬出发布链路、之后再也没被编译过」的源码安静地腐化。下面内容保留为这段历史的设计记录。
+
+「下载**一个文件**、双击就能用」的入口，给不想碰命令行的人。文件布局：
+
+```
+[ stub.exe（PE） ][ payload: job-apply-agent-portable.zip ][ footer 24 字节 ]
+footer = "OFWSFX01"(8) + uint64 payload 偏移 + uint64 payload 长度   ← 就在文件最后 24 字节
+```
+
+stub 用 `seek(EOF-24)` 找到 payload；zip 前面挂了 stub 后 `tar` 读不了，所以它先把 payload 复制到 `%TEMP%` 再解压。
+安装位置：**弹一个真正的安装对话框让用户选**（输入框 + 「浏览…」走系统标准文件夹选择器），
+默认填 `%LOCALAPPDATA%\OfferWhere`（**每用户、不需要管理员权限、不写注册表**）；装过再运行则直接启动，不重复解压。
+
+- **外壳源码** `tools/sfx/offerwhere_sfx.c`：**纯 ASCII**，中文 UI 全部写成 `\uXXXX` 转义 —— 免得编译结果依赖编译机的输入字符集。
+  它是**生成物**：改文案要改 `_tools/gen_sfx.mjs`（不随包分发），再 `node _tools/gen_sfx.mjs tools/sfx/offerwhere_sfx.c`。
+- **编译**（本机 MinGW 配方，与 `build_app.ps1` 共用 `D:\_mingw`）：
+  ```bash
+  TMP=D:\_tmp TEMP=D:\_tmp /d/_mingw/mingw64/bin/gcc.exe -O2 -mwindows -municode -Wall \
+      -o tools/sfx/build/stub.exe tools/sfx/offerwhere_sfx.c -lshell32 -lole32
+  ```
+  三个实测坑：`TMP`/`TEMP` 指向含中文的路径时 gcc 报 `can't create ...ccXXXX.o: No such file or directory`；
+  少了 `-municode` 会报 `undefined reference to 'WinMain'`（`UNICODE` + `-mwindows` 的组合要求它）；
+  `-lole32` 是文件夹选择器（COM）需要的，少了会报 `undefined reference to 'CoInitializeEx'`。
+- **对话框为什么不用 `.rc`**：构建是**单次 gcc**，没有 `windres` 步骤 ⇒ 对话框用内存里的
+  `DLGTEMPLATE` + `DialogBoxIndirectParamW` 描述（每条 item 必须 DWORD 对齐、字符串是 NUL 结尾的 UTF-16）。
+  `IFileDialog` / `IShellItem` 的 GUID 也**在源码里写死**，省掉 `-luuid`：它们是固定的 ABI，不会变。
+- **拼接 + 验收**：`./make_sfx.ps1 -Zip <便携包.zip> -SelfTest`
+  - 结构校验（秒级）：尺寸 = stub + zip + footer、footer 各字段、偏移处是 zip 签名 `PK\x03\x04`、
+    内嵌 payload 的 sha256 **与原 zip 逐字节一致**、payload 内含安装链路文件。
+  - `-SelfTest`（约 3 分钟）：用 `--extract-only` **真跑一次安装器** —— 解压整包、断言 `dist-app\offer-where.exe`
+    与 `install_first_run.bat` 落位、读回步骤日志、确认没有误启动程序、最后回收解压树。
+    **这是唯一能证明「双击就能用」的检查**；纯结构校验证明不了 copy_payload / tar 解压 / 落位判断这三段代码。
+  - footer 的 magic 与尺寸**只在 C 源码里定义一次**，`make_sfx.ps1` 是读它再写。合约测试同时钉住
+    「构建脚本不许自带第二份副本」（自带副本时改一边就能产出打不开的 exe，且四道门禁全绿）。
+- **无人值守**：`OfferWhere-Setup.exe --extract-only` 不弹任何窗、不启动任何程序，退出码即结果；
+  `OFFERWHERE_SFX_DEST=<目录>` 换安装位置、`OFFERWHERE_SFX_LOG=<文件>` 追加一份 ASCII 步骤日志。
+- **发布**：~~`release.yml` 把 `OfferWhere-Setup.exe` 与 zip 一起挂到 Release~~ —— **2026-09-28 起不再成立**，
+  这个 exe 现在由 NSIS 生成。`release.yml` 仍保留一步「从 C 源码现编译 stub」，但**只为防腐化，产物不发布**。
+- **已知取舍**：没有代码签名证书 ⇒ 用户首次运行必然看到 SmartScreen「未知发布者」，得点「更多信息 → 仍要运行」。
+
+---
+
+## 核心功能
+
+### 1. Agent SDK 集成
+
+**核心文件**: `server/index.ts`
+
+SDK 提供三个主要 API：
+
+#### query() - 发送消息并流式接收响应
+
+```typescript
+import { query } from "@tencent-ai/agent-sdk";
+
+const stream = query({
+  prompt: "用户的问题",
+  options: {
+    cwd: process.cwd(),           // 工作目录
+    model: "claude-sonnet-4",     // 模型选择
+    maxTurns: 10,                 // 最大对话轮数
+    systemPrompt: "系统提示词",    // 自定义系统提示
+    permissionMode: "default",    // 权限模式
+    canUseTool: async (toolName, input, options) => {
+      // 工具权限控制
+      return { behavior: 'allow', updatedInput: input };
+    },
+    resume: sessionId            // 恢复对话上下文
+  }
+});
+
+// 处理流式响应
+for await (const msg of stream) {
+  if (msg.type === "assistant") {
+    // 处理 AI 回复
+  } else if (msg.type === "tool_result") {
+    // 处理工具执行结果
+  }
+}
+```
+
+#### unstable_v2_createSession() - 创建 Agent 会话
+
+```typescript
+import { unstable_v2_createSession } from "@tencent-ai/agent-sdk";
+
+const session = await unstable_v2_createSession({ 
+  cwd: process.cwd() 
+});
+
+// 获取可用模型
+const models = await session.getAvailableModels();
+```
+
+#### unstable_v2_authenticate() - 身份认证
+
+```typescript
+import { unstable_v2_authenticate } from "@tencent-ai/agent-sdk";
+
+const result = await unstable_v2_authenticate({
+  environment: 'external',
+  onAuthUrl: async (authState) => {
+    console.log('需要登录:', authState.authUrl);
+  }
+});
+```
+
+### 2. 数据库设计
+
+**核心文件**: `server/db.ts`
+
+使用 SQLite 存储会话和消息：
+
+**sessions 表**
+```sql
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  model TEXT NOT NULL,
+  sdk_session_id TEXT,         -- Agent SDK 返回的 session_id
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+**messages 表**
+```sql
+CREATE TABLE messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  role TEXT CHECK (role IN ('user', 'assistant')),
+  content TEXT NOT NULL,
+  model TEXT,
+  created_at TEXT NOT NULL,
+  tool_calls TEXT,             -- JSON 格式存储工具调用
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+```
+
+### 3. 流式响应机制
+
+**核心文件**: `server/index.ts` (POST /api/chat)
+
+使用 Server-Sent Events (SSE) 实现流式响应：
+
+```typescript
+// 设置 SSE 响应头
+res.setHeader("Content-Type", "text/event-stream");
+res.setHeader("Cache-Control", "no-cache");
+res.setHeader("Connection", "keep-alive");
+
+// 发送不同类型的事件
+res.write(`data: ${JSON.stringify({ type: "init", sessionId, ... })}\n\n`);
+res.write(`data: ${JSON.stringify({ type: "text", content })}\n\n`);
+res.write(`data: ${JSON.stringify({ type: "tool", name, input, ... })}\n\n`);
+res.write(`data: ${JSON.stringify({ type: "tool_result", ... })}\n\n`);
+res.write(`data: ${JSON.stringify({ type: "permission_request", ... })}\n\n`);
+res.write(`data: ${JSON.stringify({ type: "done", ... })}\n\n`);
+```
+
+**前端处理**: `src/hooks/useChat.ts`
+
+```typescript
+const reader = response.body?.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+
+  const chunk = decoder.decode(value);
+  const lines = chunk.split('\n');
+
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const data = JSON.parse(line.slice(6));
+      
+      switch (data.type) {
+        case 'text':
+          // 更新消息内容
+          break;
+        case 'tool':
+          // 显示工具调用
+          break;
+        case 'permission_request':
+          // 弹出权限请求弹窗
+          break;
+      }
+    }
+  }
+}
+```
+
+### 4. 权限控制机制
+
+**核心文件**: `server/index.ts`, `src/hooks/useChat.ts`
+
+支持四种权限模式（在 `src/types.ts` 中定义）：
+
+```typescript
+export type PermissionMode = 
+  | 'default'              // 每次工具调用都需要确认
+  | 'acceptEdits'          // 自动接受编辑类操作
+  | 'plan'                 // 计划模式，只读
+  | 'bypassPermissions';   // 跳过所有权限检查
+```
+
+**后端实现权限回调**:
+
+```typescript
+const canUseTool: CanUseTool = async (toolName, input, options) => {
+  // bypassPermissions 模式直接放行
+  if (permissionMode === 'bypassPermissions') {
+    return { behavior: 'allow', updatedInput: input };
+  }
+  
+  // 创建权限请求
+  const requestId = uuidv4();
+  
+  // 发送权限请求到前端
+  res.write(`data: ${JSON.stringify({ 
+    type: "permission_request", 
+    requestId,
+    toolName,
+    input,
+    ...
+  })}\n\n`);
+  
+  // 等待用户响应
+  return new Promise((resolve) => {
+    pendingPermissions.set(requestId, { resolve, ... });
+  });
+};
+```
+
+**前端显示权限弹窗**:
+
+```typescript
+// useChat.ts 接收权限请求
+if (data.type === 'permission_request') {
+  setPermissionRequest({
+    requestId: data.requestId,
+    toolName: data.toolName,
+    input: data.input,
+    ...
+  });
+}
+
+// PermissionDialog.tsx 用户操作
+const handleAllow = async () => {
+  await fetch('/api/permission-response', {
+    method: 'POST',
+    body: JSON.stringify({
+      requestId: permissionRequest.requestId,
+      behavior: 'allow'
+    })
+  });
+};
+```
+
+### 5. 会话恢复机制
+
+**核心文件**: `server/index.ts`, `server/db.ts`
+
+Agent SDK 支持使用 `resume` 参数恢复对话上下文：
+
+```typescript
+// 1. 从数据库获取 SDK 返回的 session_id
+const session = db.getSession(sessionId);
+const sdkSessionId = session.sdk_session_id;
+
+// 2. 使用 resume 参数恢复对话
+const stream = query({
+  prompt: message,
+  options: {
+    ...(sdkSessionId ? { resume: sdkSessionId } : {})
+  }
+});
+
+// 3. 从流中获取新的 session_id
+for await (const msg of stream) {
+  if (msg.type === "system" && msg.subtype === "init") {
+    const newSdkSessionId = msg.session_id;
+    
+    // 4. 保存到数据库
+    db.updateSession(sessionId, { sdk_session_id: newSdkSessionId });
+  }
+}
+```
+
+### 6. 自定义 Agent 管理
+
+**核心文件**: `src/hooks/useAgents.ts`, `src/types.ts`
+
+支持创建多个 Agent 配置：
+
+```typescript
+export interface CustomAgent {
+  id: string;
+  name: string;
+  description?: string;
+  systemPrompt: string;        // 自定义系统提示词
+  icon?: string;               // 图标
+  color?: string;              // 颜色
+  permissionMode?: PermissionMode;  // 默认权限模式
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// 使用 localStorage 持久化存储
+const STORAGE_KEY = 'custom_agents';
+localStorage.setItem(STORAGE_KEY, JSON.stringify(agents));
+```
+
+---
+
+## 二次开发指南
+
+### 场景 1: 修改应用名称和样式
+
+**修改应用名称**
+
+编辑 `src/config.ts`:
+
+```typescript
+export const APP_CONFIG = {
+  name: '我的 AI 助手',           // 修改应用名称
+  nameInitial: 'A',              // 修改首字母
+  description: '你的智能助理',    // 修改描述
+  version: '1.0.0',
+};
+```
+
+**修改主题颜色**
+
+编辑 `src/index.css`:
+
+```css
+:root {
+  --primary-color: #0052d9;     /* 主色调 */
+  --success-color: #00a870;     /* 成功色 */
+  --warning-color: #ed7b2f;     /* 警告色 */
+  --error-color: #e34d59;       /* 错误色 */
+}
+```
+
+### 场景 2: 添加自定义 Agent 预设
+
+编辑 `src/hooks/useAgents.ts` 的默认 Agent：
+
+```typescript
+const defaultAgent: CustomAgent = {
+  id: 'default',
+  name: '通用助手',
+  description: '我是你的 AI 助手',
+  systemPrompt: '你是一个专业的 AI 助手，擅长编程、写作和问答。',
+  icon: 'MessageIcon',
+  color: '#0052d9',
+  permissionMode: 'default',
+  createdAt: new Date(),
+  updatedAt: new Date(),
+};
+
+// 添加新的预设 Agent
+const codeAgent: CustomAgent = {
+  id: 'code-assistant',
+  name: '代码助手',
+  description: '专注于代码开发和调试',
+  systemPrompt: '你是一个专业的代码助手，精通多种编程语言，善于代码审查、调试和优化。',
+  icon: 'CodeIcon',
+  color: '#00a870',
+  permissionMode: 'acceptEdits',
+  createdAt: new Date(),
+  updatedAt: new Date(),
+};
+
+const DEFAULT_AGENTS = [defaultAgent, codeAgent];
+```
+
+### 场景 3: 添加自定义 API 端点
+
+在 `server/index.ts` 中添加新的路由：
+
+```typescript
+// 获取会话统计信息
+app.get("/api/stats", (req, res) => {
+  try {
+    const sessions = db.getAllSessions();
+    const totalMessages = sessions.reduce((sum, session) => {
+      const messages = db.getMessagesBySession(session.id);
+      return sum + messages.length;
+    }, 0);
+    
+    res.json({
+      totalSessions: sessions.length,
+      totalMessages,
+      avgMessagesPerSession: totalMessages / sessions.length || 0
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 导出会话记录
+app.get("/api/sessions/:sessionId/export", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = db.getSession(sessionId);
+    const messages = db.getMessagesBySession(sessionId);
+    
+    const exportData = {
+      session,
+      messages: messages.map(msg => ({
+        ...msg,
+        tool_calls: msg.tool_calls ? JSON.parse(msg.tool_calls) : null
+      }))
+    };
+    
+    res.json(exportData);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+```
+
+### 场景 4: 自定义工具调用展示
+
+编辑 `src/components/ToolCallsCollapse.tsx`，修改工具调用的显示方式：
+
+```typescript
+const renderToolInput = (input: Record<string, unknown>) => {
+  // 自定义显示逻辑
+  if (input.command) {
+    return (
+      <div className="command-block">
+        <code>{input.command}</code>
+      </div>
+    );
+  }
+  
+  if (input.path) {
+    return (
+      <div className="file-path">
+        📄 {input.path}
+      </div>
+    );
+  }
+  
+  // 默认 JSON 显示
+  return <pre>{JSON.stringify(input, null, 2)}</pre>;
+};
+```
+
+### 场景 5: 添加消息导出功能
+
+**后端**: 在 `server/index.ts` 中添加导出端点（见场景 3）
+
+**前端**: 在 `src/components/ChatMessages.tsx` 中添加导出按钮：
+
+```typescript
+const handleExport = async () => {
+  try {
+    const response = await fetch(`/api/sessions/${sessionId}/export`);
+    const data = await response.json();
+    
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: 'application/json'
+    });
+    
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `session-${sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    console.error('Export failed:', error);
+  }
+};
+
+// 在组件中添加按钮
+<Button onClick={handleExport}>
+  导出对话
+</Button>
+```
+
+### 场景 6: 修改数据库结构
+
+在 `server/db.ts` 中添加新字段或表：
+
+```typescript
+// 添加新字段到 sessions 表
+db.exec(`
+  ALTER TABLE sessions ADD COLUMN tags TEXT;
+`);
+
+// 创建新表
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_settings (
+    user_id TEXT PRIMARY KEY,
+    preferences TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+`);
+
+// 添加操作函数
+export function updateSessionTags(id: string, tags: string[]): boolean {
+  const stmt = db.prepare('UPDATE sessions SET tags = ? WHERE id = ?');
+  const result = stmt.run(JSON.stringify(tags), id);
+  return result.changes > 0;
+}
+```
+
+### 场景 7: 添加文件上传功能
+
+**后端**: 在 `server/index.ts` 中添加上传端点：
+
+```typescript
+import multer from 'multer';
+import path from 'path';
+
+// 配置文件上传
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ storage });
+
+// 文件上传端点
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: '没有上传文件' });
+  }
+  
+  res.json({
+    filename: req.file.filename,
+    originalName: req.file.originalname,
+    path: req.file.path,
+    size: req.file.size
+  });
+});
+```
+
+**前端**: 在 `src/components/ChatInput.tsx` 中添加文件选择：
+
+```typescript
+const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  
+  const formData = new FormData();
+  formData.append('file', file);
+  
+  const response = await fetch('/api/upload', {
+    method: 'POST',
+    body: formData
+  });
+  
+  const data = await response.json();
+  
+  // 在消息中引用文件
+  setInputValue(prev => prev + `\n[文件: ${data.originalName}]`);
+};
+```
+
+### 场景 8: 添加代码高亮显示
+
+安装依赖:
+
+```bash
+npm install react-syntax-highlighter @types/react-syntax-highlighter
+```
+
+在 `src/components/ChatMessages.tsx` 中使用：
+
+```typescript
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+
+const renderMessageContent = (content: string) => {
+  // 检测代码块
+  const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+  
+  return content.split(codeBlockRegex).map((part, index) => {
+    if (index % 3 === 1) {
+      // 语言标识
+      const language = part || 'text';
+      const code = content.split(codeBlockRegex)[index + 1];
+      
+      return (
+        <SyntaxHighlighter
+          key={index}
+          language={language}
+          style={oneDark}
+        >
+          {code}
+        </SyntaxHighlighter>
+      );
+    }
+    
+    if (index % 3 === 0) {
+      return <span key={index}>{part}</span>;
+    }
+    
+    return null;
+  });
+};
+```
+
+### 场景 9: 添加语音输入
+
+使用 Web Speech API：
+
+```typescript
+// src/hooks/useSpeechRecognition.ts
+import { useState, useEffect } from 'react';
+
+export function useSpeechRecognition() {
+  const [isListening, setIsListening] = useState(false);
+  const [transcript, setTranscript] = useState('');
+  
+  useEffect(() => {
+    if (!('webkitSpeechRecognition' in window)) {
+      return;
+    }
+    
+    const recognition = new (window as any).webkitSpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'zh-CN';
+    
+    recognition.onresult = (event: any) => {
+      let finalTranscript = '';
+      
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalTranscript += result[0].transcript;
+        }
+      }
+      
+      if (finalTranscript) {
+        setTranscript(prev => prev + finalTranscript);
+      }
+    };
+    
+    if (isListening) {
+      recognition.start();
+    } else {
+      recognition.stop();
+    }
+    
+    return () => recognition.stop();
+  }, [isListening]);
+  
+  return {
+    isListening,
+    transcript,
+    startListening: () => setIsListening(true),
+    stopListening: () => setIsListening(false),
+    resetTranscript: () => setTranscript('')
+  };
+}
+
+// 在 ChatInput.tsx 中使用
+const { isListening, transcript, startListening, stopListening, resetTranscript } = useSpeechRecognition();
+
+useEffect(() => {
+  if (transcript) {
+    setInputValue(prev => prev + transcript);
+    resetTranscript();
+  }
+}, [transcript]);
+```
+
+### 场景 10: 实现多标签页会话
+
+**前端状态管理**: 在 `src/hooks/useSessions.ts` 中添加：
+
+```typescript
+const [openTabs, setOpenTabs] = useState<string[]>([]);
+
+const openTab = useCallback((sessionId: string) => {
+  setOpenTabs(prev => {
+    if (!prev.includes(sessionId)) {
+      return [...prev, sessionId];
+    }
+    return prev;
+  });
+}, []);
+
+const closeTab = useCallback((sessionId: string) => {
+  setOpenTabs(prev => prev.filter(id => id !== sessionId));
+}, []);
+```
+
+**UI 实现**: 在 `src/components/Header.tsx` 中添加标签栏：
+
+```typescript
+<div className="tabs-container">
+  {openTabs.map(tabId => {
+    const session = sessions.find(s => s.id === tabId);
+    return (
+      <div 
+        key={tabId}
+        className={`tab ${currentSessionId === tabId ? 'active' : ''}`}
+        onClick={() => navigate(`/chat/${tabId}`)}
+      >
+        <span>{session?.title}</span>
+        <button onClick={(e) => {
+          e.stopPropagation();
+          closeTab(tabId);
+        }}>×</button>
+      </div>
+    );
+  })}
+</div>
+```
+
+---
+
+## API 参考
+
+### 后端 API 端点
+
+#### 健康检查
+```
+GET /api/health
+响应: { status: "ok", timestamp: string }
+```
+
+#### 登录状态
+```
+GET /api/check-login
+响应: {
+  isLoggedIn: boolean,
+  method?: 'env' | 'cli' | 'none',
+  envConfigured?: boolean,
+  cliConfigured?: boolean,
+  apiKey?: string
+}
+```
+
+#### 保存环境变量配置
+```
+POST /api/save-env-config
+请求体: {
+  apiKey?: string,
+  authToken?: string,
+  internetEnv?: string,
+  baseUrl?: string
+}
+响应: { success: boolean, message: string }
+```
+
+#### 获取模型列表
+```
+GET /api/models
+响应: {
+  models: Array<{ modelId: string, name: string, description?: string }>,
+  defaultModel: string
+}
+```
+
+#### 获取所有会话
+```
+GET /api/sessions
+响应: {
+  sessions: Array<{
+    id: string,
+    title: string,
+    model: string,
+    created_at: string,
+    updated_at: string,
+    messageCount: number
+  }>
+}
+```
+
+#### 获取单个会话
+```
+GET /api/sessions/:sessionId
+响应: {
+  session: DbSession,
+  messages: Array<DbMessage>
+}
+```
+
+#### 创建会话
+```
+POST /api/sessions
+请求体: {
+  model?: string,
+  title?: string
+}
+响应: { session: DbSession }
+```
+
+#### 更新会话
+```
+PATCH /api/sessions/:sessionId
+请求体: {
+  title?: string,
+  model?: string
+}
+响应: { success: boolean }
+```
+
+#### 删除会话
+```
+DELETE /api/sessions/:sessionId
+响应: { success: boolean }
+```
+
+#### 发送消息 (SSE 流式响应)
+```
+POST /api/chat
+请求体: {
+  sessionId?: string,
+  message: string,
+  model?: string,
+  systemPrompt?: string,
+  cwd?: string,
+  permissionMode?: PermissionMode
+}
+响应: Server-Sent Events
+  - type: "init" - 初始化
+  - type: "text" - 文本内容
+  - type: "tool" - 工具调用
+  - type: "tool_result" - 工具结果
+  - type: "permission_request" - 权限请求
+  - type: "done" - 完成
+  - type: "error" - 错误
+```
+
+#### 权限响应
+```
+POST /api/permission-response
+请求体: {
+  requestId: string,
+  behavior: 'allow' | 'deny',
+  message?: string
+}
+响应: { success: boolean }
+```
+
+---
+
+## 常见定制需求
+
+### 1. 修改默认模型
+
+编辑 `server/index.ts`:
+
+```typescript
+const defaultModel = "claude-opus-4";  // 修改默认模型
+```
+
+### 2. 修改最大对话轮数
+
+编辑 `server/index.ts` 的聊天处理函数:
+
+```typescript
+const stream = query({
+  prompt: message,
+  options: {
+    maxTurns: 20,  // 从 10 改为 20
+    ...
+  }
+});
+```
+
+### 3. 添加环境变量支持
+
+创建 `.env` 文件:
+
+```bash
+PORT=3000
+CODEBUDDY_API_KEY=your_api_key
+CODEBUDDY_AUTH_TOKEN=your_auth_token
+CODEBUDDY_BASE_URL=https://api.example.com
+CODEBUDDY_INTERNET_ENVIRONMENT=external
+```
+
+在 `server/index.ts` 中使用:
+
+```typescript
+import dotenv from 'dotenv';
+dotenv.config();
+
+const PORT = process.env.PORT || 3000;
+```
+
+### 4. 自定义消息格式
+
+编辑 `src/types.ts`，扩展 Message 类型:
+
+```typescript
+export interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  model?: string;
+  timestamp: Date;
+  isStreaming?: boolean;
+  toolCalls?: ToolCall[];
+  contentBlocks?: ContentBlock[];
+  // 自定义字段
+  metadata?: {
+    userId?: string;
+    source?: string;
+    tags?: string[];
+  };
+}
+```
+
+### 5. 添加用户认证
+
+安装依赖:
+
+```bash
+npm install express-session passport passport-local bcrypt
+```
+
+在 `server/index.ts` 中添加认证中间件:
+
+```typescript
+import session from 'express-session';
+import passport from 'passport';
+import { Strategy as LocalStrategy } from 'passport-local';
+
+app.use(session({
+  secret: 'your-secret-key',
+  resave: false,
+  saveUninitialized: false
+}));
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+// 配置认证策略
+passport.use(new LocalStrategy(
+  async (username, password, done) => {
+    // 验证用户逻辑
+    const user = await db.findUser(username);
+    if (!user || !await bcrypt.compare(password, user.password)) {
+      return done(null, false);
+    }
+    return done(null, user);
+  }
+));
+
+// 保护路由
+const requireAuth = (req, res, next) => {
+  if (req.isAuthenticated()) {
+    return next();
+  }
+  res.status(401).json({ error: '需要登录' });
+};
+
+app.post('/api/chat', requireAuth, async (req, res) => {
+  // 聊天逻辑
+});
+```
+
+### 6. 添加消息搜索功能
+
+在 `server/db.ts` 中添加:
+
+```typescript
+export function searchMessages(query: string): DbMessage[] {
+  const stmt = db.prepare(`
+    SELECT * FROM messages 
+    WHERE content LIKE ? 
+    ORDER BY created_at DESC 
+    LIMIT 100
+  `);
+  return stmt.all(`%${query}%`) as DbMessage[];
+}
+```
+
+在 `server/index.ts` 中添加端点:
+
+```typescript
+app.get('/api/search', (req, res) => {
+  const { q } = req.query;
+  if (!q || typeof q !== 'string') {
+    return res.status(400).json({ error: '缺少查询参数' });
+  }
+  
+  const messages = db.searchMessages(q);
+  res.json({ messages });
+});
+```
+
+### 7. 添加 Markdown 渲染
+
+安装依赖:
+
+```bash
+npm install react-markdown remark-gfm
+```
+
+在 `src/components/ChatMessages.tsx` 中使用:
+
+```typescript
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+const MessageContent = ({ content }: { content: string }) => (
+  <ReactMarkdown 
+    remarkPlugins={[remarkGfm]}
+    components={{
+      code: ({ node, inline, className, children, ...props }) => {
+        const match = /language-(\w+)/.exec(className || '');
+        return !inline && match ? (
+          <SyntaxHighlighter
+            language={match[1]}
+            style={oneDark}
+            {...props}
+          >
+            {String(children).replace(/\n$/, '')}
+          </SyntaxHighlighter>
+        ) : (
+          <code className={className} {...props}>
+            {children}
+          </code>
+        );
+      }
+    }}
+  >
+    {content}
+  </ReactMarkdown>
+);
+```
+
+### 8. 添加快捷键支持
+
+在 `src/components/ChatInput.tsx` 中添加:
+
+```typescript
+const handleKeyDown = (e: React.KeyboardEvent) => {
+  // Ctrl/Cmd + Enter 发送消息
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    handleSend();
+  }
+  
+  // Esc 清空输入
+  if (e.key === 'Escape') {
+    setInputValue('');
+  }
+};
+
+<textarea
+  onKeyDown={handleKeyDown}
+  ...
+/>
+```
+
+### 9. 添加消息重新生成
+
+在 `src/components/ChatMessages.tsx` 中添加:
+
+```typescript
+const handleRegenerate = async (messageId: string) => {
+  // 找到该消息及其之前的用户消息
+  const messageIndex = messages.findIndex(m => m.id === messageId);
+  if (messageIndex < 0) return;
+  
+  const userMessage = messages[messageIndex - 1];
+  if (!userMessage || userMessage.role !== 'user') return;
+  
+  // 删除该消息
+  setSessions(prev => prev.map(s => {
+    if (s.id === sessionId) {
+      return {
+        ...s,
+        messages: s.messages.filter(m => m.id !== messageId)
+      };
+    }
+    return s;
+  }));
+  
+  // 重新发送用户消息
+  await sendMessage(userMessage.content);
+};
+```
+
+### 10. 添加会话分享功能
+
+**后端**: 在 `server/index.ts` 中添加:
+
+```typescript
+app.post('/api/sessions/:sessionId/share', (req, res) => {
+  const { sessionId } = req.params;
+  const session = db.getSession(sessionId);
+  const messages = db.getMessagesBySession(sessionId);
+  
+  if (!session) {
+    return res.status(404).json({ error: '会话不存在' });
+  }
+  
+  // 生成分享 token
+  const shareToken = uuidv4();
+  
+  // 保存分享信息到数据库
+  db.createShare({
+    token: shareToken,
+    session_id: sessionId,
+    created_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()  // 7天后过期
+  });
+  
+  res.json({ 
+    shareUrl: `${req.protocol}://${req.get('host')}/share/${shareToken}` 
+  });
+});
+
+app.get('/api/share/:token', (req, res) => {
+  const { token } = req.params;
+  const share = db.getShare(token);
+  
+  if (!share || new Date(share.expires_at) < new Date()) {
+    return res.status(404).json({ error: '分享链接不存在或已过期' });
+  }
+  
+  const session = db.getSession(share.session_id);
+  const messages = db.getMessagesBySession(share.session_id);
+  
+  res.json({ session, messages });
+});
+```
+
+---
+
+## 调试技巧
+
+### 1. 查看 Agent SDK 日志
+
+在 `server/index.ts` 中添加详细日志:
+
+```typescript
+for await (const msg of stream) {
+  console.log("[Stream] Message:", JSON.stringify(msg, null, 2));
+  // 处理消息...
+}
+```
+
+### 2. 查看数据库内容
+
+使用 SQLite 命令行工具:
+
+```bash
+sqlite3 data/chat.db
+
+.tables                           # 查看所有表
+SELECT * FROM sessions;           # 查看所有会话
+SELECT * FROM messages LIMIT 10;  # 查看最近 10 条消息
+```
+
+### 3. 前端调试
+
+在浏览器控制台中查看状态:
+
+```typescript
+// 在 useChat.ts 中添加
+useEffect(() => {
+  console.log('[useChat] State:', {
+    isLoading,
+    currentSessionId,
+    messagesCount: currentSession?.messages.length
+  });
+}, [isLoading, currentSessionId, currentSession]);
+```
+
+### 4. 网络请求调试
+
+在 Chrome DevTools 的 Network 标签中:
+- 筛选 `Fetch/XHR`
+- 查看 `EventStream` 类型的请求（SSE）
+- 查看请求和响应的详细内容
+
+---
+
+## 常见问题
+
+### Q: 如何修改端口号？
+
+A: 在 `server/index.ts` 中修改:
+
+```typescript
+const PORT = process.env.PORT || 3001;  // 改为 3001
+```
+
+同时更新 `package.json` 中的开发命令:
+
+```json
+{
+  "scripts": {
+    "dev:server": "PORT=3001 tsx watch server/index.ts"
+  }
+}
+```
+
+### Q: 如何禁用权限检查？
+
+A: 在创建会话时设置 `permissionMode` 为 `bypassPermissions`:
+
+```typescript
+const newSession: Session = {
+  ...
+  permissionMode: 'bypassPermissions'
+};
+```
+
+或者在 Agent 配置中设置默认权限模式。
+
+### Q: 如何清空所有数据？
+
+A: 执行以下操作:
+
+```typescript
+// 使用数据库函数
+db.clearAllData();
+
+// 或直接删除数据库文件
+rm data/chat.db
+```
+
+### Q: 消息没有显示怎么办？
+
+A: 检查以下几点:
+
+1. 后端是否正常接收到消息
+2. SSE 流是否正常发送（查看 Network 标签）
+3. 前端是否正确解析 SSE 事件
+4. 状态是否正确更新
+
+添加日志进行调试:
+
+```typescript
+console.log('[SSE] Received data:', data);
+console.log('[State] Messages:', currentSession?.messages);
+```
+
+### Q: 如何添加新的工具？
+
+A: CodeBuddy Agent SDK 的工具是由 SDK 内部管理的，无需在应用层添加。如果需要自定义工具行为，可以通过 `canUseTool` 回调进行控制。
+
+---
+
+## 生产部署
+
+### 1. 构建生产版本
+
+```bash
+# 构建前端
+npm run build
+
+# 生成的文件在 dist/ 目录
+```
+
+### 2. 使用 PM2 部署
+
+```bash
+# 安装 PM2
+npm install -g pm2
+
+# 启动应用
+pm2 start server/index.ts --name web-agent --interpreter tsx
+
+# 查看状态
+pm2 status
+
+# 查看日志
+pm2 logs web-agent
+```
+
+### 3. 使用 Docker 部署
+
+创建 `Dockerfile`:
+
+```dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --production
+
+COPY . .
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
+```
+
+构建和运行:
+
+```bash
+docker build -t web-agent .
+docker run -p 3000:3000 -v $(pwd)/data:/app/data web-agent
+```
+
+### 4. 环境变量配置
+
+在生产环境中使用环境变量:
+
+```bash
+# .env.production
+PORT=3000
+NODE_ENV=production
+CODEBUDDY_API_KEY=your_api_key
+CODEBUDDY_AUTH_TOKEN=your_auth_token
+```
+
+---
+
+## 性能优化
+
+### 1. 数据库优化
+
+```typescript
+// 添加索引
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+  CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+`);
+
+// 定期清理旧数据
+export function cleanOldSessions(daysOld: number = 30): void {
+  const cutoffDate = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000);
+  db.prepare('DELETE FROM sessions WHERE updated_at < ?')
+    .run(cutoffDate.toISOString());
+}
+```
+
+### 2. 前端优化
+
+```typescript
+// 使用 React.memo 避免不必要的重渲染
+export const ChatMessage = React.memo(({ message }: { message: Message }) => {
+  // 组件内容
+});
+
+// 使用虚拟滚动处理大量消息
+import { FixedSizeList } from 'react-window';
+
+<FixedSizeList
+  height={600}
+  itemCount={messages.length}
+  itemSize={100}
+  width="100%"
+>
+  {({ index, style }) => (
+    <div style={style}>
+      <ChatMessage message={messages[index]} />
+    </div>
+  )}
+</FixedSizeList>
+```
+
+### 3. 缓存优化
+
+```typescript
+// 缓存模型列表
+let cachedModels: Model[] = [];
+let cacheTime: number = 0;
+const CACHE_DURATION = 5 * 60 * 1000;  // 5 分钟
+
+app.get('/api/models', async (req, res) => {
+  const now = Date.now();
+  if (cachedModels.length > 0 && now - cacheTime < CACHE_DURATION) {
+    return res.json({ models: cachedModels });
+  }
+  
+  // 获取新数据
+  const models = await fetchModels();
+  cachedModels = models;
+  cacheTime = now;
+  
+  res.json({ models });
+});
+```
+
+---
+
+## 扩展阅读
+
+- [CodeBuddy Agent SDK 文档](https://codebuddy.tencent.com)
+- [Express.js 官方文档](https://expressjs.com/)
+- [React Router 文档](https://reactrouter.com/)
+- [TDesign React 组件库](https://tdesign.tencent.com/react/)
+- [better-sqlite3 文档](https://github.com/WiseLibs/better-sqlite3)
+- [Server-Sent Events (SSE) 规范](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+
+---
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request 来改进这个模板。
+
+## License
+
+MIT

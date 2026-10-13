@@ -1,0 +1,264 @@
+name: Release
+
+# 目的：把「下载即用」的第一关补上。
+# 背景（2026-09-25 开箱实测）：仓库此前**没有任何下载渠道** —— GitHub 与 Gitee
+# 均无 Release、无 tag，.github/workflows 只有 ci.yml。接收方只能拿到源码自己跑
+# 打包脚本，这不符合「软件商城下载即用」的预期；而且手工产的包不携带版本信息，
+# 曾出现「桌面包是整改做到一半的工作树快照、不对应任何提交」的情况，无从追溯。
+#
+# 本工作流：打 tag -> 跑门禁与测试 -> pack.ps1 打包（内含 version.json）-> 上传到 Release。
+#
+# 两种触发方式：
+#   1) 推 tag（推荐，版本号明确）：git tag v1.0.0 && git push origin v1.0.0
+#   2) 手动触发（GitHub 页面 Actions -> Release -> Run workflow）：
+#      只给一个「版本号」输入框；**留空会自动生成** v<日期>-<短提交号>。
+#      加这条是为了让「产出可下载的包」不必依赖本地环境 —— 本机 pre-push 钩子会跑
+#      verify/test，受限环境里可能失败；而打包是 I/O 重的活儿，交给 runner 更合适。
+#
+# Action 版本策略与 ci.yml 保持一致：checkout / setup-node 用 v5（v5 起运行在 Node 24），
+# 用 v4 会触发 GitHub 的 "Node.js 20 is deprecated" 告警。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布版本号，形如 v1.0.0（留空则自动生成 v<日期>-<短提交号>）'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # gh release create 需要
+
+jobs:
+  release:
+    name: 打包并发布
+    runs-on: windows-latest
+    # 开关来自**仓库 variable**，不是 secret —— 这是刻意的：如果它跟着 secret 一起走，
+    # 那么「删掉 PII_DENYLIST」就会静默退回「跳过扫描」，而这一步本该是最后一道防线。
+    # 本 workflow 不带 pull_request 触发，所以不需要 ci.yml 里那个 fork 例外。
+    env:
+      REQUIRE_PII_SCAN: ${{ vars.REQUIRE_PII_SCAN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      # 必须先定 tag：push 事件取 ref，手动触发取输入框（空则自动生成）。
+      # gh release create <tag> 在该 tag 不存在时会自动指向默认分支的当前提交。
+      - name: 解析发布标签
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'push') {
+            $tag = '${{ github.ref_name }}'
+          } else {
+            $tag = '${{ inputs.tag }}'
+            if ([string]::IsNullOrWhiteSpace($tag)) {
+              $short = (git rev-parse --short HEAD).Trim()
+              $tag = 'v' + (Get-Date -Format 'yyyy.MM.dd') + '-' + $short
+            }
+          }
+          if ($tag -notmatch '^v') { throw "版本号必须以 v 开头（如 v1.0.0），收到：$tag" }
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "release tag = $tag"
+
+      - name: 安装依赖
+        run: npm ci
+
+      # denylist 住在 data/ 里，而 data/ 被 gitignore ⇒ runner 上永远不存在。
+      # 结果就是「保护产物的那道门」恰好在「构建公开产物的那台机器上」静默失效
+      # （2026-09-27 读 runner 自己的日志才发现：`PII check: SKIPPED`）。
+      # 从仓库 secret 落到磁盘，并置 REQUIRE_PII_SCAN=1 —— 之后缺 denylist 即构建失败，
+      # 而不是安静地跳过。secret 未配置时只给 warning 并维持旧行为，不会突然把流水线打红。
+      - name: 落 PII denylist（来自仓库 secret）
+        shell: pwsh
+        env:
+          PII_DENYLIST: ${{ secrets.PII_DENYLIST }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PII_DENYLIST)) {
+            if ($env:REQUIRE_PII_SCAN -eq '1') {
+              Write-Host "::error::REQUIRE_PII_SCAN=1 but the PII_DENYLIST secret is not set -- refusing to build an unscanned artifact"
+              Write-Host "[error] fix: add the PII_DENYLIST repository secret (one deny token per line)."
+              exit 1
+            }
+            Write-Host "::warning::repository secret PII_DENYLIST is not set -- this release will NOT be scanned for personal data"
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path data | Out-Null
+          # WriteAllText defaults to UTF-8 without BOM, which is what pack.ps1 (ReadAllLines)
+          # and scripts/pii_guard.ts (readFileSync utf8) both expect.
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'data/.pii_denylist.txt'), $env:PII_DENYLIST)
+          Write-Host "PII denylist materialised; the pack step now fails closed if the scan cannot run"
+
+      - name: 类型检查 + 控制台语法门禁
+        run: npm run verify
+
+      - name: 回归自检 + 合约测试
+        run: npm test
+
+      # 仓库里 node/ 被 gitignore（只在打包时需要），CI 里用 runner 自带的 node 顶上
+      - name: 准备自带 Node 运行时
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ./node | Out-Null
+          Copy-Item (Get-Command node).Source ./node/node.exe
+
+      # pack.ps1 自带 fail-closed 断言（必含入口/自带 node/控制台；禁含 .env、data、
+      # src、.git、tsc 编译产物），并写入 version.json（提交号 + 构建时间 + 是否脏树）。
+      # PACK_ZIP_DIR：显式指定产物目录，不赌 runner 的 Desktop 是否存在/被重定向。
+      - name: 打包
+        shell: pwsh
+        env:
+          PACK_ZIP_DIR: ${{ runner.temp }}
+        run: |
+          ./pack.ps1
+          if ($LASTEXITCODE -ne 0) { throw "pack.ps1 failed with $LASTEXITCODE" }
+          $zip = Join-Path $env:PACK_ZIP_DIR 'job-apply-agent-portable.zip'
+          if (-not (Test-Path $zip)) { throw "pack.ps1 did not produce a zip" }
+          Write-Host ("      " + $zip + "  " + [math]::Round((Get-Item $zip).Length / 1MB, 1) + " MB")
+          "ZIP_PATH=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 解压即用冒烟（打包产物本身也验一遍）
+        shell: pwsh
+        env:
+          PACK_ZIP_DIR: ${{ runner.temp }}
+        run: |
+          # pack_smoke 会重新打包一次，这里用它的断言逻辑验的是同一份 pack.ps1 产物；
+          # 若嫌慢可移除本步（ci.yml 每次推 main 都会跑它）。
+          ./scripts/pack_smoke.ps1
+
+      # 自解压外壳（上一代 OfferWhere-Setup）自 2026-09-28 起**不再是发布资产**，由 NSIS
+      # 安装包取代。这一步留着只有一个理由：tools/sfx/ 仍在仓库里，而「从发布链路里搬走、
+      # 却再也没被编译过」的源码会安静地腐化 —— 等到哪天需要它时才发现早就编不过了。
+      # 编译一次两秒，把「它还能编」变成每次发布都验证一次的事实。
+      # gcc 是本 job 的工具链依赖之一；找不到就直接失败，而不是跳过。
+      - name: 编译自解压外壳（只为防止源码腐化，不再发布）
+        shell: pwsh
+        run: |
+          $gcc = Get-Command gcc -ErrorAction SilentlyContinue
+          if (-not $gcc) { $gcc = Get-Command x86_64-w64-mingw32-gcc -ErrorAction SilentlyContinue }
+          if (-not $gcc -and (Test-Path 'C:\mingw64\bin\gcc.exe')) { $gcc = Get-Item 'C:\mingw64\bin\gcc.exe' }
+          if (-not $gcc) { throw "no MinGW gcc on this runner; cannot build tools/sfx/build/stub.exe" }
+          Write-Host ("      gcc: " + $gcc.Source)
+          New-Item -ItemType Directory -Force -Path tools/sfx/build | Out-Null
+          & $gcc.Source -O2 -mwindows -municode -Wall -o tools/sfx/build/stub.exe tools/sfx/offerwhere_sfx.c -lshell32 -lole32
+          if ($LASTEXITCODE -ne 0) { throw "stub build failed with $LASTEXITCODE" }
+          Write-Host ("      stub.exe " + (Get-Item tools/sfx/build/stub.exe).Length + " bytes (compile-only check)")
+
+      # makensis 不能假设 runner 上有。实测（actions/runner-images 清单）：
+      #   Windows Server 2022 -> NSIS 3.10 预装；Windows Server 2025 -> **没有 NSIS**。
+      # 而 `windows-latest` 在两者之间会随时间漂移，所以这里显式探测、缺了就装，
+      # 而不是赌镜像 —— 赌输的代价是发布直接红，且原因藏在镜像里。
+      #
+      # 🔴 2026-09-29 事故（本步第一次上真流水线就红）：
+      #   choco **装成功了**（NSIS 3.13 -> C:\Program Files (x86)\NSIS），但装完只用
+      #   `Get-Command makensis` 复查 —— choco 改的是注册表里的 PATH，**不会刷新已在运行的
+      #   PowerShell 会话**（$env:PATH 是启动时的快照）⇒ 查不到 ⇒ 抛错。而当时抛的句子是
+      #   "no makensis on this runner"，把「PATH 里没有」说成了「机器上没有」，
+      #   排查方向直接跑偏（去怀疑镜像，其实东西早装好了）。
+      #   ⇒ 三条修正：① 装完**重新扫已知路径**，不只信 PATH；
+      #              ② 报错只说检查过什么，不替机器下结论；
+      #              ③ 候选路径清单与 make_nsis.ps1 **必须一致**（同一条列表在两个地方
+      #                 各写一份就会漂移 —— 那边那份是对的，这边这份就是漂移出来的），
+      #                 已加合约断言钉住两边一致，见 contract_tests「makensis 候选路径清单两边一致」。
+      - name: 确保 NSIS 已安装（缺失时才装）
+        shell: pwsh
+        run: |
+          # 路径清单必须与 make_nsis.ps1 的 locate makensis 段逐条一致。
+          # 抽成函数是为了「装之前」和「装之后」用同一把尺子 —— 两边口径不同，
+          # 就会出现「装成功了却复查不到」这种自相矛盾的状态。
+          function Find-Makensis {
+            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            $cands = @(
+              (Join-Path $env:ProgramFiles 'NSIS\makensis.exe'),
+              (Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'),
+              (Join-Path $env:LOCALAPPDATA 'Programs\NSIS\makensis.exe'),
+              'C:\ProgramData\chocolatey\bin\makensis.exe',
+              'C:\ProgramData\chocolatey\lib\nsis\tools\makensis.exe'
+            )
+            foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+            return $null
+          }
+
+          $mk = Find-Makensis
+          if (-not $mk) {
+            Write-Host '      makensis not found in PATH or the known install locations; installing NSIS'
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install nsis failed with $LASTEXITCODE" }
+            # 🔴 这里必须重新扫路径，不能只 Get-Command（原因见上面的 2026-09-29 事故）。
+            $mk = Find-Makensis
+          }
+          if (-not $mk) {
+            throw 'makensis still unavailable. Checked: PATH, ProgramFiles\NSIS, ProgramFiles(x86)\NSIS, LOCALAPPDATA\Programs\NSIS, C:\ProgramData\chocolatey\bin, C:\ProgramData\chocolatey\lib\nsis\tools'
+          }
+          Write-Host ('      makensis: ' + $mk)
+          "MAKENSIS_PATH=$mk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # -SelfTest 会真跑一次静默安装（/S /D=<temp>，解压整包）并核对：退出码 0、
+      # 12.4 万个文件、入口与卸载器都在、静默安装没有启动 GUI、%TEMP% 没有残留暂存目录。
+      # 纯结构校验证明不了「下载一个文件、双击就能用」，这一步是唯一能证明的检查。
+      - name: 构建 NSIS 安装包并静默自测
+        shell: pwsh
+        env:
+          PACK_ZIP_DIR: ${{ runner.temp }}
+        run: |
+          $setup = Join-Path $env:PACK_ZIP_DIR 'OfferWhere-Setup.exe'
+          $zip = Join-Path $env:PACK_ZIP_DIR 'job-apply-agent-portable.zip'
+          ./make_nsis.ps1 -Zip $zip -Out $setup -Makensis $env:MAKENSIS_PATH -AppVer $env:RELEASE_TAG -SelfTest
+          if ($LASTEXITCODE -ne 0) { throw "make_nsis.ps1 failed with $LASTEXITCODE" }
+          Write-Host ("      " + $setup + "  " + [math]::Round((Get-Item $setup).Length / 1MB, 1) + " MB")
+          "SETUP_PATH=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 上传到 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $setupMB = [math]::Round((Get-Item $env:SETUP_PATH).Length / 1MB, 0)
+          $zipMB = [math]::Round((Get-Item $env:ZIP_PATH).Length / 1MB, 0)
+          # 说明就是使用者下载时看到的第一段字：主推**一个文件**的安装程序，zip 作为备用。
+          # 这里的每一步都对应安装器里真实存在的东西（安装目录页 / 开始菜单与桌面入口 /
+          # 「应用和功能」里的卸载项 / /S 无人值守），不是宣传话术 —— 上一版文案里的
+          # `--extract-only` 与「再双击会直接启动」都是自解压外壳的行为，换成 NSIS 后不再成立。
+          $notes = "## 推荐：下载一个文件，双击就能装`n`n"
+          # 先把「图文说明书」摆在下手处：下载页是收件人唯一会认真读的一页，
+          # 而 Release 说明再全也只是纯文字 —— 那页说明书有每一步的截图。
+          # 🔴 2026-10-12 修复（全量测试 P0-1）：这里原先写的是仓库 Pages 地址
+          #    `https://dasikong-cell.github.io/offer-where/`，而本仓库是**私有**的
+          #    （实测 `GET /repos/.../pages` = 404、`has_pages=false`；私有仓库 + Free
+          #    计划发布不了 Pages）⇒ 该地址对收件人**恒 404**，等于把说明书入口指向墙上。
+          #    改为指向**包内自带**的说明书：装好后本机直接打开，离线可用、永不失效。
+          $notes += "**图文说明书（含每一步截图）：装好后打开 http://127.0.0.1:4400/guide/**`n`n"
+          $notes += "下载 **OfferWhere-Setup.exe**（约 $setupMB MB）并双击：`n`n"
+          $notes += "1) 弹出安装程序（标题「OfferWhere 安装」）。默认装到 %LOCALAPPDATA%\OfferWhere`n"
+          $notes += "   按用户安装，不需要管理员权限`n"
+          $notes += "2) 「选择组件」那一页**桌面图标由你决定**：默认勾选「在桌面上创建快捷方式」，`n"
+          $notes += "   不想要桌面图标就取消它 —— 开始菜单项与卸载入口不受影响，照常创建`n"
+          $notes += "3) 「选择安装位置」那一页**装在哪由你决定**：直接改路径，或点「浏览(B)...」选目录`n"
+          $notes += "   下一点「安装(I)」开始解压（约 12.4 万个文件，实测 118-141 秒，慢的那次是装到 C 盘；页面会显示所需空间约 1.1GB）`n"
+          $notes += "4) 完成后可以勾选直接运行 OfferWhere，也可以稍后从开始菜单或桌面图标启动 —— 快捷方式由安装程序建好，`n"
+          $notes += "   **不会再出现第二次「安装」提示**`n`n"
+          $notes += "卸载：「设置 → 应用 → 已安装的应用」里找到 OfferWhere 卸载。`n"
+          $notes += "卸载会**默认保留**你的 data\ 目录（简历、采集到的 JD、投递记录），要一起删会单独问你一次。`n`n"
+          $notes += "无人值守安装（不弹任何窗口，只解压；目标路径可省）：`n"
+          $notes += "    OfferWhere-Setup.exe /S /D=D:\OfferWhere`n"
+          $notes += "无人值守又不想在桌面放图标（/NODESKTOP 必须写在 /D= 之前，因为 /D= 会吃掉它后面的一切）：`n"
+          $notes += "    OfferWhere-Setup.exe /S /NODESKTOP /D=D:\OfferWhere`n`n"
+          $notes += "## 备用：便携 zip（约 $zipMB MB）`n`n"
+          $notes += "1) 解压到纯英文路径（如 D:\offer-where）。建议用系统自带 tar 或 7-Zip；别用资源管理器双击解压（包内 13 万个小文件，会非常慢）：`n"
+          $notes += "    mkdir D:\offer-where`n"
+          $notes += "    tar -xf job-apply-agent-portable.zip -C D:\offer-where`n"
+          $notes += "2) 双击 dist-app\offer-where.exe（原生外壳：自动起后端 + 平台调试窗口；包内自带 Node 运行时，无需另装；需已安装 Google Chrome）`n"
+          $notes += "   包内没有 dist-app\offer-where.exe 时（旧包）改双击 start_all.bat，效果等价。`n`n"
+          $notes += "## 共同步骤`n`n"
+          $notes += "打开控制台窗口（或 http://127.0.0.1:4400/ ），按首页「开箱自检」卡片逐项补齐（上传简历、登录各平台窗口）。`n`n"
+          $notes += "首次使用默认只做预览 —— 真实投递会不可撤销地向 HR 发出消息。`n"
+          $notes += "包内 version.json 记录了该包对应的提交号与构建时间，可随时核对版本。"
+          gh release create $tag "$env:SETUP_PATH" "$env:ZIP_PATH" --title $tag --notes $notes
+          Write-Host "release $tag created -> https://github.com/${{ github.repository }}/releases/tag/$tag"

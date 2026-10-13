@@ -1,0 +1,3951 @@
+import "./env.js"; // 必须最先加载：解析根目录 .env 注入 process.env，使 LLM_*/MAIL_*/CODEBUDDY_* 生效
+import express from "express";
+import { query, unstable_v2_createSession, unstable_v2_authenticate, PermissionResult, CanUseTool } from "@tencent-ai/agent-sdk";
+import { v4 as uuidv4 } from "uuid";
+import path from "path";
+import fs from "fs";
+import os from "os";
+import { fileURLToPath } from "url";
+import { exec, spawn } from "child_process";
+import { promisify } from "util";
+import * as db from "./db.js";
+import { fetchLatestCode, listRecentMails, testConnection } from "./services/mail.js";
+import { execAction, listSessions, closeAll } from "./services/browser.js";
+import { relaunchAll, checkAllHealth, isPortUp } from "./services/browserHealth.js";
+import { detectChromePath } from "./services/localEnv.js";
+import { DEFAULT_CDP_PORTS, readCdpOverrides } from "./services/platformPorts.js";
+import { probePlatformConnections, DELIVERY_PLATFORMS } from "./services/connection.js";
+import { parseResumeFile, structureResume } from "./services/resume.js";
+import { matchResumeToJobAi } from "./services/apply/matchAi.js";
+import { tailorResume } from "./services/apply/resumeTailor.js";
+import { ensureTailoredResumePdf, printHtmlToPdf, PDF_VIA_PLATFORMS } from "./services/apply/tailoredResumePdf.js";
+import { renderResumeDoc, sanitizeDoc, safeDocId, newDoc } from "./services/apply/resumeDoc.js";
+import { RESUME_ACCENTS, DEFAULT_ACCENT_KEY, RESUME_VARIANTS, DEFAULT_VARIANT_KEY } from "./services/apply/resumeTheme.js";
+import { isAiEnabled, getAiConfig } from "./services/apply/aiClient.js";
+import { decideGreet, decideGreetBatch, DEFAULT_EXCLUDE_KEYWORDS } from "./services/apply/greetDecision.js";
+// 🔴 求职信分两半：模板 CRUD / 变量渲染 / 台账去重是本地功能（基础侧 letterLedger），
+//    只有 composeCoverLetter 内含 LLM 系统提示词（核心侧 coverLetter）。
+//    /api/cover-letter/template 与 /api/cover-letter/render 是**基础版保留**路由，
+//    故这些符号必须从基础侧取，否则基础版一调就抛 CORE_UNAVAILABLE。
+import { composeCoverLetter } from "./services/apply/coverLetter.js";
+import {
+  markLetterSent, letterAlreadySent,
+  getLetterTemplate, saveLetterTemplate, clearLetterTemplate, renderLetterTemplate, TEMPLATE_VARIABLES,
+} from "./services/apply/letterLedger.js";
+import { buildInterviewPrep, getInterviewPrep, clearInterviewPrep } from "./services/apply/interviewPrep.js";
+import { resumeVersionStatus, setResumeVersion, getResumeVersion, resolveResumeForVersion, RESUME_VERSION_LABELS } from "./services/apply/resumeVersion.js";
+import { listSchedules, setSchedule, getSchedule, describeSchedule, evaluateSchedule, advanceSchedule } from "./services/apply/schedule.js";
+import { getExchangeActions, setExchangeActions, runExchangeActions, summarizeExchange, EXCHANGE_LABELS } from "./services/apply/exchangeContact.js";
+import { ensureChatResumePng, decideResumeChannel, sendChatResumeImage, CHAT_IMAGE_INPUTS } from "./services/apply/chatResumeImage.js";
+import { locateJobById } from "./services/apply/jobLocate.js";
+import { tryScreenshot } from "./services/apply/common.js";
+// 校招卡片标签的**唯一定义**（供 /api/jobs 下发，前端不再抄一份）。
+import { CARD_UI_TAGS } from "./services/parseCardMeta.js";
+// 投递复盘的口径层（纯函数：什么算「已投出」、几天算「没进展」都在里面）。
+// ⚠️ 单独一个模块而不是写在路由里：口径要能被单测钉住，写在路由里就只能靠肉眼核对。
+import { buildReviewPlan } from "./services/reviewPlan.js";
+import { runApply, isSupported, SUPPORTED_PLATFORMS, classifyDelivery, isWangshenUrl } from "./services/apply/index.js";
+import { computeAbReport, backfillLegacyStrategy } from "./services/apply/applyAbTest.js";
+import { checkResumeCompliance } from "./services/apply/resumeCompliance.js";
+import { toApplyProfile, recordFrames } from "./services/apply/common.js";
+import { startRecording, stopRecording } from "./services/apply/screencast.js";
+import {
+  runBatchApply, resolveDailyLimit, todayAppliedCount,
+  readPlatformRiskBlock, clearPlatformRiskBlock, previewBatchRouting, type BatchEvent,
+} from "./services/apply/batch.js";
+import { rememberCurrentForm } from "./services/apply/officialApply.js";
+import { scanOfferbiuEmails, emailPoolStats, type EmailScanScope, type ScanProgress } from "./services/offerbiuEmailScan.js";
+import { runAutoReply, isAutoReplyPlatform, listAutoReplyPlatforms, type AutoReplyPlatformInfo } from "./services/apply/autoReplyRunner.js";
+import { startWatcher, stopWatcher, watcherStatus, setWatchConfig, bootstrapWatcher, watchEmitter } from "./services/apply/autoReplyWatcher.js";
+import { startWatcher as startApplyWatch, stopWatcher as stopApplyWatch, watcherStatus as applyWatchStatus, setWatchConfig as setApplyWatchConfig, bootstrapWatcher as bootstrapApplyWatch, watchEmitter as applyWatchEmitter } from "./services/apply/autoApplyWatcher.js";
+import { collectOfferbiu, collectOfferbiuByKeywords } from "./services/offerbiuCollect.js";
+import { probePlatformApi } from "./services/platformApi/bossOpenApi.js";
+import { probePlatformHealthCached, summarizeHealth } from "./services/platformHealth.js";
+import { cleanupData } from "./services/dataCleanup.js";
+import { buildAllowedOrigins, canInjectToken, checkRequestOrigin, lanOriginsFromIps, isLoopbackIp } from "./services/requestGuard.js";
+// 管道噪声识别来自**基础侧** `pipeNoise.js`（不是核心的 safeOp.js）：
+// 下面两个 process 级错误处理器要用它，若它随核心一起缺席，就会「在错误处理器里抛错」
+// ⇒ 异常逃逸 ⇒ 进程直接死。2026-10-12 实测确认。safeOp.ts 只是 re-export，特征表仍只有一份。
+import { isPipeNoise } from "./services/pipeNoise.js";
+import { isCoreUnavailable, coreOr, coreRequiredReplied, CORE_REQUIRED_MESSAGE } from "./coreBridge.js";
+import { getAuthToken, isAuthEnabled, isAuthorizedStrict, SIDE_EFFECT_GET_PATHS, PUBLIC_READ_GET_PATHS, isPublicReadGet, isAuthorizedStaticRes, signStaticPath, isConsoleAsset, isGuideAsset, isPairAnonRequest } from "./services/authToken.js";
+import { buildPairSetCookie, getPairCode, isPairedRequest, isPairingEnabled, pairWithCode, pairedDeviceCount } from "./services/pairing.js";
+import { queueErrorAlert, alertStatus, sendTestAlert } from "./services/errorAlert.js";
+import { listCities, cityCount, findCity, isCitySupported, DEFAULT_CITY } from "./services/cities.js";
+import { locateByIp } from "./services/geo.js";
+import { JOB_APPLY_AGENT_PROMPT } from "../shared/agentPrompt.js";
+
+const execAsync = promisify(exec);
+
+/** 默认端口：与全部投递/采集脚本、控制台的 4400 约定保持一致（避免「开箱即坏」） */
+const DEFAULT_PORT = 4400;
+
+/**
+ * 本发行版是否带「核心」（自动化 + AI）。
+ *
+ * 判据 = 调用一个**核心专属**导出，捕获 `CORE_UNAVAILABLE` —— 与 `scripts/contract_tests.ts`
+ * 的 `CORE_SHIPPED` **同一套探针**（同一件事两处不重复定义判据）。
+ * 为什么不能用别的办法：基础侧（coreBridge）不能 import 核心，否则它自己也会被桩化；
+ * 而这里在 server 侧，本来就 import 了核心模块，调用一次即可。
+ *
+ * ⚠️ 探针必须有**确定性**且**无副作用**：`listAutoReplyPlatforms()` 只读一份平台清单，
+ *    桩里它被替换成 `__unavailable`（调用即抛），真实现里是纯查表。
+ */
+const CORE_SHIPPED: boolean = (() => {
+  try {
+    listAutoReplyPlatforms();
+    return true;
+  } catch (err) {
+    if (isCoreUnavailable(err)) return false;
+    throw err;
+  }
+})();
+
+/** 本机 API 基础地址（写入 Agent 提示词） */
+const API_BASE = process.env.APP_PUBLIC_URL || `http://127.0.0.1:${process.env.PORT || DEFAULT_PORT}`;
+
+// 待处理的权限请求
+interface PendingPermission {
+  resolve: (result: PermissionResult) => void;
+  reject: (error: Error) => void;
+  toolName: string;
+  input: Record<string, unknown>;
+  sessionId: string;
+  timestamp: number;
+}
+
+const pendingPermissions = new Map<string, PendingPermission>();
+
+// 权限请求超时时间（5分钟）
+const PERMISSION_TIMEOUT = 5 * 60 * 1000;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = Number(process.env.PORT || DEFAULT_PORT);
+/** 监听地址：默认仅本机回环；如需局域网/其它设备访问，显式设 HOST=0.0.0.0（会暴露到内网） */
+const HOST = process.env.HOST || '127.0.0.1';
+
+// ── 运行日志：错误落盘，便于事后排查（data/run_log/YYYY-MM-DD.log）──
+const RUN_LOG_DIR = path.join(__dirname, '..', 'data', 'run_log');
+try { if (!fs.existsSync(RUN_LOG_DIR)) fs.mkdirSync(RUN_LOG_DIR, { recursive: true }); } catch { /* 忽略 */ }
+const RUN_LOG_MAX_BYTES = Math.max(1, Number(process.env.RUN_LOG_MAX_MB) || 20) * 1024 * 1024;
+let inLogRun = false;
+
+function logRun(level: 'INFO' | 'ERROR', msg: string): void {
+  // 重入守卫：日志写入过程本身出错时不再递归记录（自激放大的第二道防线）
+  if (inLogRun) return;
+  inLogRun = true;
+  try {
+    const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
+    // console 可能因管道断开而同步抛错 —— 不能让它把主流程带崩
+    try { if (level === 'ERROR') console.error(line); else console.log(line); } catch { /* 忽略 */ }
+    try {
+      const file = path.join(RUN_LOG_DIR, new Date().toISOString().slice(0, 10) + '.log');
+      // 单文件体积上限：任何未预料的日志风暴都不该把磁盘写满（实测曾写到 240MB）
+      let size = 0;
+      try { size = fs.statSync(file).size; } catch { /* 文件不存在 */ }
+      if (size < RUN_LOG_MAX_BYTES) fs.appendFileSync(file, line + '\n');
+    } catch { /* 落盘失败不影响主流程 */ }
+    // 无人值守告警：ERROR 额外走邮件通道（去重 + 节流，见 services/errorAlert.ts）
+    if (level === 'ERROR') { try { queueErrorAlert(msg); } catch { /* 告警失败不影响主流程 */ } }
+  } finally {
+    inLogRun = false;
+  }
+}
+
+// ── 安全中间件：JSON 体积 + CORS 白名单 + 写请求来源校验 ──
+// 目的：防止任意网页调用本机 API 触发真实投递/发信（DNS-rebinding / 恶意页面静默调用）。
+// 局域网多人 / 手机共用：把 HOST 设为 0.0.0.0 即可 —— 服务端会自动把本机网卡地址
+// 并入来源白名单（见下方 LAN_IPS / lanOriginsFromIps），无需再手填 EXTRA_ORIGINS。
+// EXTRA_ORIGINS 保留为「非本机网卡来源」的手工补充通道。
+app.use(express.json({ limit: '15mb' }));
+
+// ── 安全响应头（2026-09-25 加固）──
+// 关键：控制台会触发**真实副作用**（投递/发信），必须防「被任意站点 iframe 套娃 + 诱导点击」（点击劫持）。
+// 来源校验拦不住**同源 iframe 内**的点击 —— 只有 frame-ancestors / X-Frame-Options 能拦。
+// 控制台为单文件内联 JS（无外链、无 eval），故 script-src 保留 'unsafe-inline'，其余收紧。
+app.use((_req, res, next) => {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' blob: data:; " +
+      "frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'",
+  );
+  next();
+});
+
+/** 本机全部非回环 IPv4 地址（手机 / 平板走这些地址访问控制台） */
+function detectLanIpv4(): string[] {
+  const out: string[] = [];
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+      for (const ni of ifaces[name] || []) {
+        // 不同 Node/类型版本里 family 可能是 'IPv4' 或 4，两种都收
+        const fam = String(ni.family);
+        if ((fam === 'IPv4' || fam === '4') && !ni.internal && ni.address) out.push(ni.address);
+      }
+    }
+  } catch { /* 拿不到网卡信息就当作「无局域网地址」，不影响本机使用 */ }
+  return out;
+}
+
+/** HOST 是回环 → 仅本机可达；否则（0.0.0.0 / 局域网 IP）视为已暴露到局域网 */
+const HOST_IS_LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(String(HOST).toLowerCase());
+const LAN_EXPOSED = !HOST_IS_LOOPBACK;
+/** 仅暴露到局域网时把本机网卡地址并入来源白名单：回环时手机根本连不上，无需放行 */
+const LAN_IPS = LAN_EXPOSED ? detectLanIpv4() : [];
+/** 手机 / 平板可访问的控制台地址（暴露到局域网时才有值） */
+const LAN_URLS = lanOriginsFromIps(PORT, LAN_IPS);
+
+const ALLOWED_ORIGINS = buildAllowedOrigins(
+  PORT,
+  [
+    ...String(process.env.EXTRA_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+    // 自动并入本机局域网地址：浏览器同源写请求也会带 Origin，漏了就会 403（见 requestGuard.ts）
+    ...LAN_URLS,
+    ...lanOriginsFromIps(5173, LAN_IPS), // 开发态 Vite 前端也可能被局域网访问
+  ],
+);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  // 仅对白名单来源回显 CORS 头；不回显时浏览器侧会自动拒绝读取
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    // 必须同时列出 X-Auth-Token / Authorization：否则浏览器预检会因
+    // 「请求头不在 Allow-Headers 里」而拒发实际请求 —— 症状是
+    // 「同源页面能开、控制台一调带令牌的接口就失败」，且只在跨源（如局域网另一端口）时暴露。
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-Auth-Token,Authorization');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
+  const verdict = checkRequestOrigin({
+    method: req.method,
+    origin,
+    secFetchSite: req.headers['sec-fetch-site'] as string | undefined,
+    allowed: ALLOWED_ORIGINS,
+  });
+  if (!verdict.ok) { res.status(403).json({ error: verdict.reason }); return; }
+  next();
+});
+
+// ── 访问令牌（可选鉴权）──
+// 默认 HOST=127.0.0.1（回环）时关闭 → 本机自用零影响；
+// 一旦暴露到局域网（HOST=0.0.0.0）自动开启，或显式 REQUIRE_AUTH=1 强制开启。
+//
+// 🔴 策略：**默认全部要令牌**，只有 `PUBLIC_READ_GET_PATHS` 里那几个探活/元信息 GET 放行。
+// 原来是反过来的（GET 全放行 + 副作用 GET 黑名单），2026-09-30 改掉，因为实测漏了隐私：
+// HOST=0.0.0.0 下裸 curl 无令牌 → `/api/resume/file` 返回整份简历 PDF、
+// `/api/profile` 返回姓名手机邮箱、`/api/jobs` 返回 1000 条职位、`/api/applications` 返回 500 条投递。
+// 「GET 无副作用」被错当成了「GET 可公开」，但**只读 ≠ 无隐私**；
+// 而且黑名单会随新增路由静默失效，白名单的失败方向才是安全的（新接口默认受保护）。
+// 同时白名单仍挡不住的那类 GET（`/api/auto-reply/run` 等）继续由 `SIDE_EFFECT_GET_PATHS` 兜底。
+// 两份清单都在 `services/authToken.ts`（单一真相源，合约测试直接 import 它）。
+//
+// ⚠️ 除了探活接口，控制台**自己的静态资源**也必须放行（`/`、`/app.ico`、`/manifest.webmanifest`、
+// `/sw.js`、`/pwa-*.png`）。第一版只放行 /api/*，结果 `GET /` 直接 401 —— 控制台连页面都打不开。
+// curl 测 `/api/*` 全「符合预期」，完全看不出这个问题；是**真浏览器**跑一次才暴露的
+// （见 scripts/_console_auth_verify.mts）。放行它们是安全的：全是控制台的 HTML/图标/SW，
+// 不含任何个人信息；而控制台页面本身不带令牌（令牌是服务端注入进 HTML 的），
+// 挡住它等于把钥匙锁在屋里。真正要保护的是 data/ 下的截图与 API 数据，那两处仍在门后。
+const AUTH_ENABLED = isAuthEnabled(HOST);
+/**
+ * 配对闸门：只在鉴权开启（非回环监听）时才有意义 —— 回环下连令牌都不用，谈不上配对。
+ *
+ * 为什么需要它：`canInjectToken` 只能按**对方地址**判断能不能注入令牌，而同一 Wi-Fi 下
+ * 「用户自己的手机」与「隔壁同事的笔记本」都是 `192.168.x.x` —— 地址这一维区分不了。
+ * 于是 `HOST=0.0.0.0` 时同网段任何设备打开控制台都能拿到令牌，而令牌能触发真实投递。
+ * 配对码就是补上那条**带外信道**：码打在你自己的屏幕上，别人看不到。
+ * `PAIRING=off` 可关（退回"地址即信任"的旧行为）。
+ */
+const PAIRING_ENABLED = AUTH_ENABLED && isPairingEnabled();
+if (AUTH_ENABLED) {
+  app.use((req, res, next) => {
+    const m = String(req.method || '').toUpperCase();
+    if (m === 'OPTIONS') return next();
+    if (isPublicReadGet(m, String(req.path || ''))) return next();
+    if (isConsoleAsset(m, String(req.path || ''))) return next();
+    // 配对页与「用配对码换设备凭证」——它们本身就是取得授权的手段，挡在门后即死循环。
+    // 安全性由配对码本身保证（6 位 + 一次性 + 失败限速），见 services/pairing.ts。
+    if (PAIRING_ENABLED && isPairAnonRequest(m, String(req.path || ''))) return next();
+    // 使用说明页（public/guide/）—— 判据见 authToken.ts 的 isGuideAsset。
+    // 少了这一行，控制台侧栏底部那个「使用说明」入口在鉴权开启时直接 401：
+    // 收件人自己桌面（HOST 回环、鉴权关）没事，恰恰是 `start_lan.bat` 开了
+    // HOST=0.0.0.0 之后、他在手机上看控制台时点不动 —— 而手机上看控制台
+    // 正是说明书第七节推荐的做法。**浏览器取资源的方式**这类缺陷 curl 测不出来。
+    if (isGuideAsset(m, String(req.path || ''))) return next();
+    // 静态资源（证据截图 / 录制帧 / 定制简历）走 URL 上的短时签名：
+    // 浏览器里 `<img src>`、`<a href>`、`window.open` 都**无法附加请求头**，
+    // 只认请求头就会让控制台里那些图全变裂图（`onerror` 还会把它们隐藏掉，
+    // 用户看到的是「证据没了」而不是报错，更难查）。
+    // 签名只授权**这一个路径**且短时有效，比把它们整体放开安全得多。
+    if (isAuthorizedStaticRes(req)) return next();
+    if (isAuthorizedStrict(req)) return next();
+    res.status(401).json({ error: '缺少或无效的访问令牌（请在请求头带 X-Auth-Token，令牌见 data/.auth_token）' });
+  });
+  logRun('INFO', `访问令牌鉴权已开启（令牌文件 data/.auth_token；匿名放行的 GET：${PUBLIC_READ_GET_PATHS.join(', ')}）`);
+  if (PAIRING_ENABLED) {
+    // 配对码要打在**用户自己的屏幕上**才有意义 —— 这条带外信道正是它的全部安全性来源。
+    // 同时也落到 data/.pair_code，方便窗口被关掉/滚屏之后还能查。
+    logRun('INFO', `局域网配对已开启：新设备首次访问需输入配对码（PAIRING=off 可关；当前已配对 ${pairedDeviceCount()} 台）`);
+    console.log('');
+    console.log('  ┌──────────────────────────────────────────────────┐');
+    console.log(`  │  局域网设备首次访问的配对码：  ${getPairCode()}                 │`);
+    console.log('  │  仅本机访问不需配对；配对码一次性，用过自动更换   │');
+    console.log('  └──────────────────────────────────────────────────┘');
+    console.log('');
+  }
+}
+
+// ── 5xx 统一落日志 + 告警 ──
+// 多数路由自己 try/catch 后直接返回 500 JSON，不会走到终末错误中间件；
+// 这里在响应结束时兜底统计，保证「接口真的挂了」也能进 run_log 并触发邮件告警。
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    if (res.statusCode >= 500 && !(res as any).__errLogged) {
+      (res as any).__errLogged = true;
+      logRun('ERROR', `HTTP ${res.statusCode} ${req.method} ${req.originalUrl}`);
+    }
+  });
+  next();
+});
+
+// 静态资源：浏览器截图
+const SCREENSHOT_DIR = path.join(__dirname, '..', 'data', 'screenshots');
+if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+app.use('/data/screenshots', express.static(SCREENSHOT_DIR));
+
+// 静态资源：微信推文 JD 长图（`scripts/capture_wechat_jd_images.ts` 落盘，文件名 = <jobId>.png）。
+//
+// 🔴 这个挂载是**补的**（2026-10-11 实测发现）：`data/jd_images` 是本仓库唯一一个
+//    「出现在库里、也被前端引用、却漏了注册」的 data/ 子目录 ——
+//    `GET /data/jd_images/<jobId>.png` 实测 404，于是在控制台里点「长图」
+//    永远只能看到「该岗位无 JD 长图」（库里其实有 248 条）。
+//    本文件下方 `RESUME_DOC_DIR` 处的注释已经把规矩写清楚了（静态挂载 /
+//    `authToken.SIGNED_PATH_PREFIXES` / `dataCleanup` 不碰清单，三处缺一即静默失效），
+//    这里就是那次漏注册的补课。
+const JD_IMAGE_DIR = path.join(__dirname, '..', 'data', 'jd_images');
+if (!fs.existsSync(JD_IMAGE_DIR)) fs.mkdirSync(JD_IMAGE_DIR, { recursive: true });
+app.use('/data/jd_images', express.static(JD_IMAGE_DIR));
+
+// 静态资源：投递操作证据截图（对标 CareerBoom.ai「每次投递生成操作录屏」）
+const EVIDENCE_DIR = path.join(__dirname, '..', 'data', 'evidence');
+if (!fs.existsSync(EVIDENCE_DIR)) fs.mkdirSync(EVIDENCE_DIR, { recursive: true });
+app.use('/data/evidence', express.static(EVIDENCE_DIR));
+
+// 静态资源：一岗一简历生成的定制简历 PDF/HTML（供前端预览与下载）
+const TAILORED_DIR = path.join(__dirname, '..', 'data', 'resume_tailored');
+if (!fs.existsSync(TAILORED_DIR)) fs.mkdirSync(TAILORED_DIR, { recursive: true });
+app.use('/data/resume_tailored', express.static(TAILORED_DIR));
+
+// 简历制作（D 批）的导出产物目录。
+// ⚠️ 在 `data/` 下新增子目录必须**同步注册三处**，缺一处都会只在特定时机暴露：
+//   ① 这里 mkdir + 静态挂载（缺 ⇒ 404）；
+//   ② `authToken.SIGNED_PATH_PREFIXES`（缺 ⇒ 局域网访问 401，本机永远测不出来）；
+//   ③ `dataCleanup` 的「任何档位都不碰」清单（缺 ⇒ 跑一次清理就把用户刚做的简历删了）。
+const RESUME_DOC_DIR = path.join(__dirname, '..', 'data', 'resume_doc');
+if (!fs.existsSync(RESUME_DOC_DIR)) fs.mkdirSync(RESUME_DOC_DIR, { recursive: true });
+app.use('/data/resume_doc', express.static(RESUME_DOC_DIR));
+
+// 静态资源：投递控制台（单一入口 App，public/console.html）
+const CONSOLE_DIR = path.join(__dirname, '..', 'public');
+if (!fs.existsSync(CONSOLE_DIR)) fs.mkdirSync(CONSOLE_DIR, { recursive: true });
+// 控制台统一走 `/`（那里按需注入访问令牌）；直接开 /console.html 会拿到未注入令牌的页面
+app.get('/console.html', (_req, res) => { res.redirect('/'); });
+
+// ── PWA 静态资源（manifest / Service Worker / 图标） ──────────────────────────
+// 这些文件由 express.static 自动托管（就在 CONSOLE_DIR 下），但需要三处显式处理：
+//
+// 1) MIME：`.webmanifest` 不在 express 默认 mime 表里（会退化成 octet-stream）——
+//    Chrome 对 manifest 的 MIME 有要求，退回 octet-stream 时**整个 manifest 被忽略**，
+//    「添加到主屏幕」就退化成普通书签（没有图标、没有独立窗口）。
+//    `.js` 在 Windows 上还要防 IIS/注册表把 MIME 改成 text/plain 的经典事故。
+// 2) Service Worker 的 scope：带 `Service-Worker-Allowed: /`，即使将来 sw.js 挪到子目录
+//    也仍能管辖整个源。
+// 3) 缓存：sw.js **必须** no-cache —— 浏览器对 SW 脚本有 24h 缓存上限，
+//    若不显式禁缓存，改了 sw.js 后用户手机上可能一整天都跑旧版。
+//    manifest 同样给 no-cache（体积才 1KB，每次刷新拿最新的收益远大于省这点流量）。
+//    图标是内容寻址的稳定资源，给一天缓存。
+const PWA_TYPES: Record<string, string> = {
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+};
+app.use((req, res, next) => {
+  const p = String(req.path || '');
+  const ext = path.extname(p).toLowerCase();
+  if (!PWA_TYPES[ext]) return next();
+  res.type(PWA_TYPES[ext]);
+  if (ext === '.webmanifest' || p === '/sw.js') {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  } else if (ext === '.png') {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+  }
+  if (p === '/sw.js') res.setHeader('Service-Worker-Allowed', '/');
+  next();
+});
+
+app.use(express.static(CONSOLE_DIR));
+
+/** 发送配对页（读不到文件就退化为一段极简提示 —— 绝不把 `/` 变成 500） */
+function sendPairPage(res: any): void {
+  try {
+    res.status(200).type('html').send(fs.readFileSync(path.join(CONSOLE_DIR, 'pair.html'), 'utf8'));
+  } catch {
+    res.status(200).type('html').send(
+      '<!doctype html><meta charset="utf-8"><title>需要配对</title>'
+      + '<p>这台设备需要配对：请在运行 OfferWhere 的电脑上查看 <code>data/.pair_code</code>，或服务端窗口里的配对码。</p>',
+    );
+  }
+}
+
+// ── 配对页 / 用配对码换设备凭证（匿名可达，见 services/pairing.ts 的说明）──
+app.get(['/pair', '/pair.html'], (_req, res) => {
+  if (!PAIRING_ENABLED) { res.redirect('/'); return; }
+  sendPairPage(res);
+});
+
+app.post('/api/pair', (req, res) => {
+  if (!PAIRING_ENABLED) { res.status(404).json({ error: '配对未启用' }); return; }
+  const r = pairWithCode(req, (req.body || {}).code);
+  if (!r.ok) {
+    if (r.retryAfterSec) res.setHeader('Retry-After', String(r.retryAfterSec));
+    res.status(400).json({ error: r.reason, retryAfterSec: r.retryAfterSec });
+    return;
+  }
+  res.setHeader('Set-Cookie', buildPairSetCookie(r.cookie, r.maxAgeSec));
+  res.json({ ok: true });
+});
+
+// 查看当前配对码 —— **仅回环**。否则"看码"本身就成了绕过配对的第一步。
+app.get('/api/pair/code', (req, res) => {
+  if (!PAIRING_ENABLED) { res.status(404).json({ error: '配对未启用' }); return; }
+  if (!isLoopbackIp(req.socket?.remoteAddress || '')) {
+    res.status(403).json({ error: '仅本机可查看配对码' });
+    return;
+  }
+  res.json({ code: getPairCode(), pairedDevices: pairedDeviceCount() });
+});
+
+app.get("/", (req, res) => {
+  const file = path.join(CONSOLE_DIR, 'console.html');
+  if (!AUTH_ENABLED) { res.sendFile(file); return; }
+  // 🔴 鉴权开启时把令牌注入页面 —— 但**只能注入给「本机 / 内网直连」**。
+  //
+  // 2026-09-30 实测（REQUIRE_AUTH=1）：
+  //   匿名 GET /                    -> 200，响应体带完整 48 位令牌
+  //   用该令牌 GET /api/resume/file -> 200，348KB 简历被完整下载
+  // 原注释写的「同源，外部站点读不到」是错的：CORS 只挡跨源 JS **读取**，
+  // 挡不住任何人直接用浏览器打开这个 URL 看源码 ⇒ 暴露到公网 = 鉴权被完全绕过。
+  //
+  // 现在：对端必须是回环/私有网段，且不带任何转发头（反代/隧道必然带）才注入。
+  // 公网经反代进来时地址是回环但带 X-Forwarded-For ⇒ 不注入，页面会提示手填令牌。
+  if (!canInjectToken({ remoteAddress: req.socket?.remoteAddress, headers: req.headers })) {
+    res.sendFile(file);
+    return;
+  }
+  // 🔴 局域网 + 配对开启 + 这台设备还没配对 ⇒ 发**配对页**，不注入令牌。
+  //
+  // 「能不能注入」原先只看对方地址是不是私有网段，而同一 Wi-Fi 下用户自己的手机
+  // 与别人的笔记本都是 192.168.x.x ⇒ 地址这一维区分不了，同网段任何设备都能拿到令牌。
+  // 配对码补上那条带外信道。**回环（用户自己的电脑）不走这一步**，本机自用零打扰。
+  if (PAIRING_ENABLED && !isLoopbackIp(req.socket?.remoteAddress || '') && !isPairedRequest(req)) {
+    sendPairPage(res);
+    return;
+  }
+  try {
+    const html = fs.readFileSync(file, 'utf8').replace(
+      '</head>',
+      `<script>window.__AUTH_TOKEN__=${JSON.stringify(getAuthToken())};</script></head>`,
+    );
+    res.type('html').send(html);
+  } catch {
+    res.sendFile(file);
+  }
+});
+
+// 缓存可用模型列表
+let cachedModels: Array<{ modelId: string; name: string; description?: string }> = [];
+/**
+ * 上次**尝试**拉取模型清单的时间（无论成功失败）。
+ * 失败也要记 —— 否则「加超时」只是把挂 30s 变成挂 8s，下一个请求照样原样重试。
+ */
+let modelsFetchedAt = 0;
+/** 模型清单缓存窗口：窗口内即便为空也不再打 SDK（负缓存） */
+const MODELS_TTL_MS = 10 * 60 * 1000;
+/** 本地超时：SDK 自己的 initialize 超时实测 ~30s，等它等于让 HTTP 请求一起挂住 */
+const MODELS_FETCH_TIMEOUT_MS = 8000;
+const defaultModel = "claude-sonnet-4";
+
+// 健康检查
+app.get("/api/ping", (_req, res) => {
+  // 极轻探活：不触碰 DB / AI / 浏览器，供脚本与 watchdog 判断「进程是否已就绪」
+  res.json({ ok: true, uptimeMs: Math.round(process.uptime() * 1000) });
+});
+app.get("/api/health", (req, res) => {
+  // 🔴 `isAiEnabled()` 属核心（AI 客户端）。基础版里它是桩，直接调会把整个健康检查变成 500 ——
+  //    而健康检查是启动器/watchdog 判断「进程是否活着」的依据，绝不能因缺席的核心而失败。
+  //    「AI 未启用」本来就是基础版的真实状态，所以兜底值是 false，不是「假装未知」。
+  res.json({ status: "ok", timestamp: new Date().toISOString(), ai: coreOr(() => isAiEnabled(), false) });
+});
+
+// ── 局域网 / 手机访问信息（供控制台展示「手机访问地址」） ──────────────────────
+// 双端互通说明：桌面端与手机端都连这一台后端、读写同一份 SQLite(data/chat.db)，
+// 因此数据天然共享 —— 只要手机能连上（HOST=0.0.0.0 且与本机同一网络）。
+// 本接口只暴露「本机自己算出来的网卡地址」，不含任何秘密。
+app.get("/api/lan", (_req, res) => {
+  res.json({
+    exposed: LAN_EXPOSED,
+    host: HOST,
+    port: PORT,
+    authEnabled: AUTH_ENABLED,
+    urls: LAN_URLS,
+    hint: LAN_EXPOSED
+      ? '手机 / 平板与本机连同一 Wi-Fi，浏览器打开上面任一地址即可使用同一套数据'
+      : '当前仅监听本机回环（127.0.0.1）。要手机访问，请用 start_lan.bat 启动，或设 HOST=0.0.0.0',
+  });
+});
+
+// ── 版本标识：让「我现在跑的是哪一版」可自证 ──────────────────────────────────
+// 背景（2026-09-26 对齐「商城软件」差距表）：version.json 只存在于分发包里，
+// 用户装完后 UI 看不到任何版本信息，报障时无法说明自己是哪一版。
+// 仓库里开发时没有 version.json（gitignore），此时 commit/builtAt 为 null，属正常。
+app.get("/api/version", (_req, res) => {
+  const root = path.join(__dirname, '..');
+  let build: { commit?: string; builtAt?: string; dirty?: boolean } = {};
+  try { build = JSON.parse(fs.readFileSync(path.join(root, 'version.json'), 'utf8')); } catch { /* 开发树无此文件 */ }
+  let pkgVersion = '';
+  try { pkgVersion = String(JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version || ''); } catch { /* 忽略 */ }
+  res.json({
+    version: pkgVersion || 'dev',
+    commit: build.commit || null,
+    builtAt: build.builtAt || null,
+    dirty: typeof build.dirty === 'boolean' ? build.dirty : null,
+    repo: 'Dasikong-Cell/offer-where',
+  });
+});
+
+// ── 能力清单：让**前端**也知道「我跑的是基础版还是完整版」────────────────────
+//
+// 为什么需要它（2026-10-12）：后端早就把核心缺席翻译得很体面了 —— 核心路由回
+// 501 + `code:'CORE_REQUIRED'` + 一句文案，前端 `api()` 的 `data.error` 会把它显示出来。
+// 但那是**撞到之后**才知道。用户打开基础版控制台时，侧栏 16 个入口看上去都一样，
+// 只能一个个点过去试，撞到哪个才发现哪个需要完整版。
+//
+// 所以补一个**自证**端点：前端在启动时拉一次，若 `core === false` 就顶上一条横幅，
+// 把「你是基础版、哪些能力需要完整版」一次说清。
+//
+// 🔴 刻意**不**下发「哪些面板属于核心」的清单。试过机械推导（扫 navigate() → loadXxx() →
+//    函数调用闭包 → 与核心路由求交，见 `_tools/core_split/derive_frontend_core_map.mjs`），
+//    结论是**这个问题在前端层面没有可靠答案**：控制台的前端是一堆互相复用的函数，
+//    `loadDashboard` 顺着调用链能摸到 40+ 个接口、其中 9 个属核心 ⇒ 16 个视图里 8 个都成了
+//    "mixed"。按这种结果置灰必然**误判**，而误判会把**真能用**的功能藏起来，比不置灰更糟。
+//    ⇒ 具体到某个功能，交给「点下去时那条请求自己说话」，那是准确的。
+app.get("/api/capabilities", (_req, res) => {
+  res.json({
+    ok: true,
+    core: CORE_SHIPPED,
+    // 完整版下为空串：前端据 `core` 判断，不靠文案有没有内容来判断
+    message: CORE_SHIPPED ? '' : CORE_REQUIRED_MESSAGE,
+    // 版本自证一并带上，方便报障时说清「我是哪一版」
+    edition: CORE_SHIPPED ? 'full' : 'base',
+  });
+});
+
+// ── 检查更新：对照 Releases 最新版，提示用户去下载 ──────────────────────────
+// 只读公开 API，不自动下载、不自动安装（单机绿色包，更新 = 重新解压）。
+// 无外网 / 查不到时如实返回，绝不报错打断使用。
+//
+// 🔴 2026-10-12 修复（全量测试 P0-1，实测证据在 _tools/_audit/FULLTEST_REPORT.md）：
+//    本端点原先对**所有** 404 都回「仓库还没有发布过 Release」。可本仓库是**私有**的
+//    ⇒ 未认证请求一律 404（实测 未认证=404 / 带令牌=200 / `has_pages=false`）
+//    ⇒ 每个最终用户看到的都是这句**假话**，而实际上已有 5 个 Release。
+//    「看不见」与「不存在」是两件事，混成一句就没法排查。现在明确三分：
+//      · 2xx            → 正常比对版本
+//      · 401/403/404    → **无法访问**（非公开仓库 / 令牌无效 / 不存在），绝不冒充「没发过」
+//      · 抛异常/其他码   → 原样带出
+//    另补两处：
+//      ① 本机 `data/.github_token` 存在时带上 Authorization —— 开发者自己的安装能看到真实结果；
+//      ② GitHub 读不到时额外探一次 **Gitee 镜像**（公开仓库），镜像一旦有发行版，
+//         收件人**零代码改动**就能拿到可用结果（当前 Gitee 发行版为空，属预期）。
+const GH_REPO = 'Dasikong-Cell/offer-where';
+const GITEE_REPO = 'grand-minister-of-works/offer-where';
+app.get("/api/update-check", async (_req, res) => {
+  const root = path.join(__dirname, '..');
+  let build: { commit?: string } = {};
+  try { build = JSON.parse(fs.readFileSync(path.join(root, 'version.json'), 'utf8')); } catch { /* 忽略 */ }
+  let pkgVersion = '';
+  try { pkgVersion = String(JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version || ''); } catch { /* 忽略 */ }
+  const current = { version: pkgVersion || 'dev', commit: build.commit || null };
+  const base = {
+    current,
+    repo: GH_REPO,
+    // 两个下载页都给出去：即便 API 读不到，收件人也能手动打开其中一个。
+    links: {
+      github: `https://github.com/${GH_REPO}/releases`,
+      gitee: `https://gitee.com/${GITEE_REPO}/releases`,
+    },
+  };
+
+  // 「已是最新」判定：tag 与包版本一致，或 tag 含包的构建提交号（自动 tag 形如 v<日期>-<短提交号>）
+  const verdict = (tag: string) => {
+    const sameVersion = tag.replace(/^v/i, '') === current.version;
+    const sameCommit = !!(current.commit && tag.toLowerCase().includes(String(current.commit).toLowerCase()));
+    const same = sameVersion || sameCommit;
+    return { updateAvailable: !same, note: same ? '已是最新版' : '有新版本可下载' };
+  };
+  const mkLatest = (tag: string, name: string, url: string, publishedAt: unknown, assets: number) =>
+    ({ tag, name, url, publishedAt: publishedAt || null, assets });
+
+  let token = '';
+  try { token = fs.readFileSync(path.join(root, 'data', '.github_token'), 'utf8').trim(); } catch { /* 没有就用匿名 */ }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const headers: Record<string, string> = {
+      'User-Agent': 'offer-where-update-check',
+      Accept: 'application/vnd.github+json',
+    };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const r = await fetch(`https://api.github.com/repos/${GH_REPO}/releases/latest`, {
+      signal: ctrl.signal,
+      headers,
+    });
+    if (r.ok) {
+      const j: any = await r.json();
+      const tag = String(j.tag_name || '');
+      return res.json({
+        ...base,
+        source: 'github',
+        latest: mkLatest(tag, String(j.name || tag),
+          String(j.html_url || `https://github.com/${GH_REPO}/releases/tag/${tag}`),
+          j.published_at, Array.isArray(j.assets) ? j.assets.length : 0),
+        ...verdict(tag),
+      });
+    }
+    if (r.status === 401 || r.status === 403 || r.status === 404) {
+      const why = token
+        ? `GitHub 返回 ${r.status}（令牌无效或无权访问该仓库）`
+        : `无法读取仓库信息（GitHub 返回 ${r.status}）—— 该仓库当前非公开，未登录时看不到它的 Releases`;
+      // 回退：Gitee 镜像（公开仓库）。镜像没有发行版时 items 为空数组，属正常，照旧如实返回。
+      const g = await fetch(`https://gitee.com/api/v5/repos/${GITEE_REPO}/releases/latest`, {
+        signal: ctrl.signal,
+        headers: { 'User-Agent': 'offer-where-update-check' },
+      }).catch(() => null);
+      if (g && g.ok) {
+        const gj: any = await g.json().catch(() => null);
+        const gtag = String((gj && gj.tag_name) || '');
+        if (gtag) {
+          return res.json({
+            ...base,
+            source: 'gitee',
+            latest: mkLatest(gtag, String((gj && gj.name) || gtag),
+              String((gj && gj.html_url) || `https://gitee.com/${GITEE_REPO}/releases/tag/${gtag}`),
+              gj && gj.published_at, 0),
+            ...verdict(gtag),
+          });
+        }
+      }
+      return res.json({
+        ...base, source: null, latest: null, updateAvailable: false,
+        note: why + '；可手动打开下载页查看。',
+      });
+    }
+    return res.json({
+      ...base, source: null, latest: null, updateAvailable: false,
+      note: `GitHub 返回 ${r.status}，暂时查不到最新版`,
+    });
+  } catch (e: any) {
+    res.json({
+      ...base, source: null, latest: null, updateAvailable: false,
+      note: '检查更新失败（无外网或 GitHub 不可达）：' + String(e?.message || e),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+// ── 首跑自检：把「还差什么才能投出第一份简历」变成可读清单 ──────────────────────
+// 背景（2026-09-25 开箱实测）：接收方解压后对着控制台无从下手 —— 浏览器窗口没开、
+// 简历没上传、平台没登录，界面不会告诉他「下一步做什么」；更糟的是缺少
+// data/browser/cdp.json 时投递会退化成 Playwright 自带 Chromium 并报
+// 「Chromium 浏览器未下载」，而 README 从未提过这个文件。本接口把这类前置条件显式化。
+// 注意：只做**快速**探测（端口 TCP 探活，不导航页面）—— 避免像 /api/platforms/health
+// 那样串行跑 15 个平台要 12s。
+app.get("/api/selfcheck", async (_req, res) => {
+  type Item = { id: string; label: string; status: 'ok' | 'todo' | 'warn'; detail: string };
+  const items: Item[] = [];
+
+  // 1) Node 运行时（自带 = 接收方无需安装）
+  const bundledNode = fs.existsSync(path.join(__dirname, '..', 'node', 'node.exe'));
+  items.push({
+    id: 'runtime', label: 'Node 运行时', status: 'ok',
+    detail: bundledNode ? '使用包内自带 node（无需另装）' : `使用系统 node ${process.version}`,
+  });
+
+  // 2) Chrome（CDP 调试窗口的前提）
+  const chrome = detectChromePath();
+  items.push({
+    id: 'chrome', label: 'Google Chrome', status: chrome ? 'ok' : 'todo',
+    detail: chrome || '未检测到 Chrome。请安装后重新启动：https://www.google.com/chrome/',
+  });
+
+  // 3) 平台端口表（内置默认即可工作，cdp.json 仅作覆盖）
+  const overrides = readCdpOverrides();
+  const overrideCount = Object.keys(overrides).length;
+  items.push({
+    id: 'ports', label: '平台端口表', status: 'ok',
+    detail: overrideCount
+      ? `data/browser/cdp.json 覆盖了 ${overrideCount} 项`
+      : `使用内置默认端口（${Object.keys(DEFAULT_CDP_PORTS).length} 项），无需手工配置`,
+  });
+
+  // 4) 调试窗口是否已打开（并行探活，全失败也只需 ~1.2s）
+  // ⚠️ start_all.bat 只开 5 个核心平台窗口（BOSS/猎聘/51job/智联/官网），而这里统计的是
+  //    全部已登记端口 —— 首跑用户看到「已打开 5/15」却不知道剩下 10 个怎么开，
+  //    所以把补齐方式直接写进 detail，而不是只报一个比例。
+  const ports = Array.from(new Set(Object.values(DEFAULT_CDP_PORTS))).sort((a, b) => a - b);
+  const aliveFlags = await Promise.all(ports.map((p) => isPortUp(p, 1200)));
+  const alive = ports.filter((_, i) => aliveFlags[i]);
+  const winHint = '其余平台：双击 start_platforms.bat（默认再开 9 个，加 all 全开），或在控制台对应平台卡片点「打开窗口」';
+  items.push({
+    id: 'windows', label: '平台调试窗口', status: alive.length ? 'ok' : 'todo',
+    detail: alive.length
+      ? `已打开 ${alive.length}/${ports.length} 个（端口 ${alive.join(', ')}）`
+        + (alive.length < ports.length ? `。${winHint}` : '（已全部打开）')
+      : `尚未打开任何平台窗口。双击 start_all.bat（开 5 个核心平台）或 start_platforms.bat 后重试`,
+  });
+
+  // 5) 简历（未上传则投递与「一岗一简历」都无法工作）
+  // ⚠️ 这里给的**路径必须与控制台实际菜单一致**：原文写「我的档案」，
+  //    而左侧导航根本没有这个入口（真实位置是「简历 → 简历中心 → 上传简历」）
+  //    —— 首跑用户照着找不到，等于没给指引。
+  const resumePath = path.join(RES_DATA, 'resume_source.pdf');
+  const hasResume = fs.existsSync(resumePath);
+  items.push({
+    id: 'resume', label: '简历', status: hasResume ? 'ok' : 'todo',
+    detail: hasResume
+      ? `已上传（${Math.round(fs.statSync(resumePath).size / 1024)} KB）`
+      : '尚未上传。左侧「简历 → 简历中心」→「上传简历」选 PDF / Word（≤8MB）——未上传时投递与「一岗一简历」都不可用',
+  });
+
+  // 6) AI（可选，缺失只降级不阻塞）
+  const aiOn = isAiEnabled();
+  items.push({
+    id: 'ai', label: 'AI 能力（可选）', status: aiOn ? 'ok' : 'warn',
+    detail: aiOn
+      ? '已启用：语义匹配 + AI 文案 + AI 自动复聊'
+      : '未配置 LLM_*：将使用「规则匹配 + 模板文案」，功能完整可用，仅质量略降',
+  });
+
+  const todo = items.filter((i) => i.status === 'todo').length;
+  res.json({ ok: todo === 0, todo, items, checkedAt: new Date().toISOString() });
+});
+
+// 投递漏斗 + 匹配度看板（对照同类产品「数据洞察」补齐的可视化数据层）
+app.get("/api/stats/funnel", (_req, res) => {
+  try {
+    const rows = db.query<{ source: string; status: string; c: number }>(
+      "SELECT source, status, COUNT(*) c FROM jobs GROUP BY source, status"
+    );
+    const scored = db.query<{ c: number; avg: number }>(
+      "SELECT COUNT(*) c, AVG(match_score) avg FROM jobs WHERE match_score IS NOT NULL"
+    )[0] || { c: 0, avg: 0 };
+    const buckets = db.query<{ b: string; c: number }>(
+      `SELECT CASE WHEN match_score>=70 THEN 'high' WHEN match_score>=40 THEN 'mid' ELSE 'low' END b, COUNT(*) c
+       FROM jobs WHERE match_score IS NOT NULL GROUP BY b`
+    );
+    const quarantined = (db.query<{ c: number }>("SELECT COUNT(*) c FROM jobs WHERE quarantine IS NOT NULL")[0] || { c: 0 }).c;
+    // 匹配分「依据来源」三分拆分。
+    // ⚠️ 2026-09-19 起**取消了职位名兜底打分**（此前无 JD 时用职位名匹配并封顶 70，
+    //    实测「BOSS 246 个高分里 242 个是兜底」，按匹配度排序等于随机排序）。
+    // 所以现在是三档：真 JD / 卡片摘要（不是 JD，曾伪装成 JD）/ 完全无 JD。
+    // 只报一个笼统的「JD 覆盖率」会让数字虚高（首轮就报过 89%，真实只有 26%）。
+    const basis = db.query<{ title_only: number; jd_based: number; card_only: number; image_jd: number }>(
+      `SELECT SUM(CASE WHEN jd IS NULL OR TRIM(jd)='' THEN 1 ELSE 0 END) title_only,
+              SUM(CASE WHEN jd IS NOT NULL AND TRIM(jd)<>'' THEN 1 ELSE 0 END) jd_based,
+              SUM(CASE WHEN (jd IS NULL OR TRIM(jd)='') AND card_text IS NOT NULL AND TRIM(card_text)<>'' THEN 1 ELSE 0 END) card_only,
+              SUM(CASE WHEN jd_source='image' THEN 1 ELSE 0 END) image_jd
+       FROM jobs`
+    )[0] || { title_only: 0, jd_based: 0, card_only: 0, image_jd: 0 };
+    const highWithJd = (db.query<{ c: number }>(
+      "SELECT COUNT(*) c FROM jobs WHERE match_score>=70 AND jd IS NOT NULL AND TRIM(jd)<>''"
+    )[0] || { c: 0 }).c;
+    // 跳过原因分布（我们比同类产品多的一层）：每条被跳过的岗位都有可读理由，
+    // 按「原因前缀」归并后，能直接看出是哪条规则在大量误杀。
+    const skipRows = db.query<{ reason: string; c: number }>(
+      `SELECT skip_reason reason, COUNT(*) c FROM jobs
+       WHERE skip_reason IS NOT NULL AND TRIM(skip_reason) <> ''
+       GROUP BY skip_reason ORDER BY c DESC LIMIT 40`
+    );
+    const skipByRule: Record<string, number> = {};
+    for (const r of skipRows) {
+      const key = String(r.reason).split(/[（(:：]/)[0].trim().slice(0, 20) || '其他';
+      skipByRule[key] = (skipByRule[key] || 0) + r.c;
+    }
+    const skipTotal = (db.query<{ c: number }>(
+      "SELECT COUNT(*) c FROM jobs WHERE skip_reason IS NOT NULL AND TRIM(skip_reason) <> ''"
+    )[0] || { c: 0 }).c;
+    // 求职信台账：已写过多少封（三重去重的①号依据）
+    const lettersSent = (db.query<{ c: number }>("SELECT COUNT(*) c FROM cover_letters")[0] || { c: 0 }).c;
+    // 已定位（公司背调/岗位定位）过的岗位数
+    const located = (db.query<{ c: number }>(
+      "SELECT COUNT(*) c FROM app_kv WHERE key LIKE 'located:%'"
+    )[0] || { c: 0 }).c;
+    const bySource: Record<string, any> = {};
+    let total = 0, applied = 0, candidate = 0, unavailable = 0;
+    for (const r of rows) {
+      bySource[r.source] = bySource[r.source] || { source: r.source, candidate: 0, applied: 0, unavailable: 0, total: 0 };
+      bySource[r.source][r.status] = (bySource[r.source][r.status] || 0) + r.c;
+      bySource[r.source].total += r.c;
+      total += r.c;
+      if (r.status === 'applied') applied += r.c; else if (r.status === 'candidate') candidate += r.c; else if (r.status === 'unavailable') unavailable += r.c;
+    }
+    const bucketMap = { high: 0, mid: 0, low: 0 };
+    for (const b of buckets) bucketMap[b.b as 'high' | 'mid' | 'low'] = b.c;
+    res.json({
+      total,
+      byStatus: { applied, candidate, unavailable },
+      appliedRate: total ? Math.round((applied / total) * 100) : 0,
+      quarantined,
+      bySource: Object.values(bySource).sort((a: any, b: any) => b.total - a.total),
+      matchScore: {
+        scored: scored.c,
+        coverage: total ? Math.round((scored.c / total) * 100) : 0,
+        avg: scored.avg ? Math.round(scored.avg) : 0,
+        high: bucketMap.high, mid: bucketMap.mid, low: bucketMap.low,
+        /** 无 JD 的岗位（现在明确不给分，不参与按分数排序） */
+        titleOnly: basis.title_only,
+        /** 基于真实 JD 的岗位数 */
+        jdBased: basis.jd_based,
+        /** 其中：虽有"看起来像 JD"的文本、实为列表卡片摘要的（不是岗位描述） */
+        cardTextOnly: basis.card_only,
+        /** JD 为长图的岗位（微信校招推文：JD 是图片，已抓取可查看，但无法文本匹配） */
+        imageJd: basis.image_jd,
+        /** 真 JD 覆盖率（jdBased / total）—— 这是唯一可信的覆盖率口径 */
+        realJdRate: total ? Math.round((basis.jd_based / total) * 100) : 0,
+        /** 高匹配里真正基于 JD 的数量（这才是可信的高匹配） */
+        highWithJd,
+      },
+      /** 跳过原因：total 为被主动跳过的岗位数，byRule 为按规则归并的分布 */
+      skipReasons: {
+        total: skipTotal,
+        byRule: Object.entries(skipByRule).map(([rule, count]) => ({ rule, count })).sort((a, b) => b.count - a.count),
+        samples: skipRows.slice(0, 12).map((r) => ({ reason: r.reason, count: r.c })),
+      },
+      /** 求职信台账条数（三重去重①的依据） */
+      lettersSent,
+      /** 已定位/背调过的岗位数 */
+      located,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "统计失败" });
+  }
+});
+
+// 个人中心汇总（**只回计数**）。
+// ⚠️ 为什么必须单开一个端点：控制台 `loadProfile()` 为了在「个人中心」显示几个数字，
+//    曾分别拉 `/api/jobs`（真实库 2500+ 条全量）与 `/api/applications`（全量）
+//    ——为了数个数把整库搬过网，岗位池越大越慢。这里全部走 SQL COUNT 聚合，
+//    返回体固定百余字节，与岗位池规模无关。
+app.get("/api/stats/summary", (_req, res) => {
+  try {
+    const count = (sql: string): number => (db.query<{ c: number }>(sql)[0] || { c: 0 }).c;
+    const byStatus = db.query<{ status: string; c: number }>(
+      "SELECT status, COUNT(*) c FROM jobs GROUP BY status"
+    );
+    let jobs = 0, candidate = 0, applied = 0, unavailable = 0;
+    for (const r of byStatus) {
+      jobs += r.c;
+      if (r.status === 'candidate') candidate = r.c;
+      else if (r.status === 'applied') applied = r.c;
+      else if (r.status === 'unavailable') unavailable = r.c;
+    }
+    const scored = db.query<{ c: number; avg: number }>(
+      "SELECT COUNT(*) c, AVG(match_score) avg FROM jobs WHERE match_score IS NOT NULL"
+    )[0] || { c: 0, avg: 0 };
+    res.json({
+      jobs,
+      jobsByStatus: { candidate, applied, unavailable },
+      applications: count("SELECT COUNT(*) c FROM applications"),
+      /** 已打过匹配分的岗位数与平均分（无 JD 的岗位明确不给分，不计入） */
+      match: { scored: scored.c, avg: scored.avg ? Math.round(scored.avg) : 0 },
+      // 🔴 简历定制台账**只落在磁盘**（data/resume_tailored/*.json），一条都没进库
+      //    ⇒ 这里**不能**用 SQL 数，份数与列表由 /api/resume/tailored-history 给。
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取汇总失败" });
+  }
+});
+
+
+/** AI 匹配历史（**服务端为准**）。
+ *  ⚠️ 为什么必须有这个端点：控制台此前把每次匹配只写进 localStorage（`ow_match_history_v1`），
+ *    于是「换台设备 / 换浏览器 / 清一次缓存」历史就没了，而且它与库里的 `jobs.match_score`
+ *    是**两份真相**。匹配本来就把分数与明细写回库了（`matched_at` 记时刻），
+ *    所以这里直接从 jobs 读 —— localStorage 退化为「当场粘贴 JD 那类没有行的记录」的补位，
+ *    前端**必须**把每条标注来源（已入库 / 仅本机），不许再混着显示。
+ *  排序：`matched_at` 倒序；老数据没有该列 ⇒ 退到 `updated_at`，并在条目上标 `atUnknown`。 */
+app.get("/api/stats/match-history", (req, res) => {
+  try {
+    const n = Number(req.query?.limit);
+    // 显式夹取并取整：这里的 limit 会拼进 SQL，绝不能把原始 query 串带进去
+    const limit = Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 1), 200) : 30;
+    const rows = db.query<any>(
+      "SELECT id, company, position, source, match_score, match_detail, matched_at, updated_at "
+      + "FROM jobs WHERE match_score IS NOT NULL "
+      + "ORDER BY COALESCE(matched_at, updated_at) DESC LIMIT ?",
+      [limit]
+    );
+    const items = rows.map((r) => {
+      let detail: any = null;
+      try { detail = r.match_detail ? JSON.parse(r.match_detail) : null; } catch { detail = null; }
+      return {
+        jobId: r.id,
+        company: r.company || '',
+        position: r.position || '',
+        source: r.source || '',
+        score: typeof r.match_score === 'number' ? Math.round(r.match_score) : null,
+        matched: Array.isArray(detail?.matched) ? detail.matched : [],
+        missing: Array.isArray(detail?.missing) ? detail.missing : [],
+        suggestions: Array.isArray(detail?.suggestions) ? detail.suggestions : [],
+        /** ISO 串；`atUnknown=true` 表示这是老数据、只有 updated_at 可用，不要当精确匹配时刻展示 */
+        at: r.matched_at || r.updated_at || '',
+        atUnknown: !r.matched_at,
+        /** 来源固定为库，前端据此标「已入库」 */
+        origin: 'db' as const,
+      };
+    });
+    res.json({ total: items.length, limit, items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取匹配历史失败" });
+  }
+});
+
+// 投递复盘（对标 offerbiu `/review/`）：指标 + 四段行动清单。
+// 口径全部在 server/services/reviewPlan.ts，这里只负责取数并把「现在」传进去。
+// ⚠️ now 只在这里取一次（纯函数内部不读时钟）⇒ 同一次请求里所有「距今天数」用的是同一个今天，
+//    不会出现「前半段按 23:59:59 算、后半段按 00:00:00 算」这种跨日错位。
+app.get("/api/stats/review", (_req, res) => {
+  try {
+    // 复盘口径（回复率/推进率/行动清单）需要**全集**才能算对，所以这里显式要全量。
+    // 🔴 原来写的是 2000 —— 那是「够用就行」的隐式上限：库内条数一旦越过它，四个指标
+    //    会同时悄悄变小，而页面、日志、门禁都不会有任何变化。要全集就写全集（0）。
+    const apps = db.listApplications(0);
+    // 只取「待投递且未被规则跳过」的岗位 —— 复盘要的是「现在还能投的」，不是岗位池全量。
+    // 被跳过的（如「已投递过」）如果混进来，「优先投这批」就会把做过的活又列一遍。
+    const jobs = db.query<any>(
+      "SELECT id, company, position, source, apply_url, deadline, skip_reason, status "
+      + "FROM jobs WHERE status = 'candidate' AND (skip_reason IS NULL OR TRIM(skip_reason) = '')"
+    );
+    res.json(buildReviewPlan(apps, jobs, { now: new Date() }));
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取复盘数据失败" });
+  }
+});
+
+
+/** 平台可用性巡检：连接 / 登录态 / 风控 三合一结论 + 处置建议。
+ *  ?deep=1（默认）会导航各平台页面做权威判定（约 8s/平台）；deep=0 只测 CDP 连接。
+ *  用途：投递/采集前先看一眼，避免「跑完 50 个投出 0 个却不知道为什么」。 */
+app.get("/api/platforms/health", async (req, res) => {
+  try {
+    const deep = req.query.deep !== '0';
+    const list = String(req.query.platforms || '').split(',').map((s) => s.trim()).filter(Boolean);
+    // 全量 deep 巡检会真实导航 15 个平台页面（约 12.7s），而控制台每次刷新都会调它
+    // —— 故走 45s TTL 缓存；定向 platforms= 调用不缓存（见 platformHealth 注释）。
+    // ?refresh=1 跳过缓存，用于人工要求"现在重测"。
+    const { list: health, cached, ageMs } = await probePlatformHealthCached(
+      list.length ? list : undefined, deep, req.query.refresh === '1',
+    );
+    res.json({ deep, summary: summarizeHealth(health, deep), platforms: health, cached, ageMs });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '巡检失败' });
+  }
+});
+
+/** 平台 API 通道自检：CDP 端点 / 登录态（关键鉴权 Cookie）/ 两条通道开关。
+ *  用途：会话掉线巡检、诊断「登在本机日常 Chrome 而非调试窗口」的经典问题。 */
+app.get("/api/platform-api/probe", async (req, res) => {
+  try {
+    // ?deep=1 时额外做页面级权威登录判定（导航首页，较慢但准确；默认只用 Cookie 弱信号）
+    res.json(await probePlatformApi(req.query.deep === '1'));
+  } catch (error: any) {
+    // 本路由自己吞异常，终末中间件看不到 ⇒ 必须在这里收口（否则基础版回 500 并吐出内部路径）
+    if (coreRequiredReplied(error, res)) return;
+    res.status(500).json({ error: error?.message || "探测失败" });
+  }
+});
+
+// AI 能力状态（自动回复话术是否走大模型）：enabled=已配置 LLM_*；model=当前模型
+app.get("/api/ai-status", (_req, res) => {
+  const cfg = getAiConfig();
+  res.json({ enabled: cfg !== null, model: cfg?.model || null, baseUrl: cfg?.baseUrl || null });
+});
+
+// 登录方式类型
+type LoginMethod = 'env' | 'cli' | 'none';
+
+interface LoginStatusResponse {
+  isLoggedIn: boolean;
+  method?: LoginMethod;
+  envConfigured?: boolean;
+  cliConfigured?: boolean;
+  error?: string;
+  apiKey?: string; // 脱敏后的 API Key
+  envVars?: {
+    apiKey?: string;
+    authToken?: string;
+    internetEnv?: string;
+    baseUrl?: string;
+  };
+}
+
+// 检查 CodeBuddy CLI 登录状态
+app.get("/api/check-login", async (req, res) => {
+  const response: LoginStatusResponse = {
+    isLoggedIn: false,
+    envConfigured: false,
+    cliConfigured: false,
+    envVars: {},
+  };
+  
+  // 1. 检查环境变量
+  const apiKey = process.env.CODEBUDDY_API_KEY;
+  const authToken = process.env.CODEBUDDY_AUTH_TOKEN;
+  const internetEnv = process.env.CODEBUDDY_INTERNET_ENVIRONMENT;
+  const baseUrl = process.env.CODEBUDDY_BASE_URL;
+  
+  if (apiKey || authToken) {
+    response.envConfigured = true;
+    // 脱敏显示
+    if (apiKey) {
+      response.envVars!.apiKey = apiKey.slice(0, 8) + '****' + apiKey.slice(-4);
+      response.apiKey = response.envVars!.apiKey;
+    }
+    if (authToken) {
+      response.envVars!.authToken = authToken.slice(0, 8) + '****' + authToken.slice(-4);
+    }
+    if (internetEnv) {
+      response.envVars!.internetEnv = internetEnv;
+    }
+    if (baseUrl) {
+      response.envVars!.baseUrl = baseUrl;
+    }
+  }
+  
+  // ⚠️ 必须加超时护栏。实测（2026-09-25 开箱）：**未配置凭据时 `unstable_v2_authenticate`
+  // 会永久挂起且不抛错** —— 本接口 60s 零响应、后端日志一片空白，前端按钮永久卡在
+  // 「检查中…」且 disabled。开发机已登录 CodeBuddy 所以从未暴露，但**分发给他人后接收方必然触发**。
+  // 可用 AUTH_CHECK_TIMEOUT_MS 调整（默认 8000ms）。
+  const AUTH_TIMEOUT_MS = Number(process.env.AUTH_CHECK_TIMEOUT_MS) || 8000;
+  let authTimer: NodeJS.Timeout | undefined;
+  try {
+    let needsLogin = false;
+    
+    const result = await Promise.race([
+      unstable_v2_authenticate({
+        environment: 'external',
+        onAuthUrl: async (authState) => {
+          // 如果执行到这个回调，说明未登录
+          needsLogin = true;
+          console.log('[Check Login] 需要登录，认证 URL:', authState.authUrl);
+          // 将认证 URL 返回给前端（如果需要）
+          response.error = '未登录，请先登录 CodeBuddy CLI';
+        }
+      }),
+      new Promise<never>((_, reject) => {
+        authTimer = setTimeout(
+          () => reject(new Error(
+            `登录检查超时（${AUTH_TIMEOUT_MS}ms）：多半是未配置 CODEBUDDY_API_KEY / CODEBUDDY_AUTH_TOKEN`
+          )),
+          AUTH_TIMEOUT_MS
+        );
+      }),
+    ]);
+    
+    // 如果没有触发 onAuthUrl 回调，说明已登录
+    if (!needsLogin && result?.userinfo) {
+      response.isLoggedIn = true;
+      response.cliConfigured = true;
+      
+      // 判断登录方式
+      if (response.envConfigured) {
+        response.method = 'env';
+      } else {
+        response.method = 'cli';
+      }
+      
+      console.log('[Check Login] 已登录用户:', result.userinfo.userName);
+    } else if (!needsLogin) {
+      // result 存在但没有 userinfo，仍然认为已登录
+      response.isLoggedIn = true;
+      response.cliConfigured = true;
+      response.method = response.envConfigured ? 'env' : 'cli';
+    }
+  } catch (error: any) {
+    console.error("[Check Login] SDK Error:", error);
+    
+    // 如果有环境变量配置，仍然认为是登录状态
+    if (response.envConfigured) {
+      response.isLoggedIn = true;
+      response.method = 'env';
+    } else {
+      response.error = error?.message || String(error);
+      response.method = 'none';
+    }
+  } finally {
+    // 成功路径也要清掉定时器，避免每次请求都留下一个 8s 的悬挂 Timer
+    if (authTimer) clearTimeout(authTimer);
+  }
+  
+  res.json(response);
+});
+
+// 保存环境变量配置
+app.post("/api/save-env-config", (req, res) => {
+  const { apiKey, authToken, internetEnv, baseUrl } = req.body;
+  
+  if (!apiKey && !authToken) {
+    return res.status(400).json({ error: '请至少配置 API Key 或 Auth Token' });
+  }
+  
+  const configuredVars: string[] = [];
+  
+  // 设置环境变量（仅在当前进程有效）
+  if (apiKey) {
+    process.env.CODEBUDDY_API_KEY = apiKey;
+    configuredVars.push('CODEBUDDY_API_KEY');
+  }
+  if (authToken) {
+    process.env.CODEBUDDY_AUTH_TOKEN = authToken;
+    configuredVars.push('CODEBUDDY_AUTH_TOKEN');
+  }
+  if (internetEnv) {
+    process.env.CODEBUDDY_INTERNET_ENVIRONMENT = internetEnv;
+    configuredVars.push('CODEBUDDY_INTERNET_ENVIRONMENT');
+  }
+  if (baseUrl) {
+    process.env.CODEBUDDY_BASE_URL = baseUrl;
+    configuredVars.push('CODEBUDDY_BASE_URL');
+  }
+  
+  // 清除模型缓存，以便重新获取
+  cachedModels = [];
+  // 同时清掉负缓存时间戳，否则刚配好凭据也要等满 TTL 才会重新拉取
+  modelsFetchedAt = 0;
+  
+  res.json({ 
+    success: true, 
+    message: `已设置: ${configuredVars.join(', ')}`,
+    note: '环境变量仅在当前服务器进程有效，重启后需要重新设置'
+  });
+});
+
+// 获取可用模型列表
+//
+// 🔴 2026-10-11 审计：实测本端点**每次都要挂 ~30 秒**才返回，而且每次都重来一遍。
+//    成因是两件事叠加：
+//      ① `unstable_v2_createSession()` + `getAvailableModels()` 在未配置 `CODEBUDDY_*`
+//         时会一直等到 SDK 自己的 initialize 超时才 reject（实测日志：
+//         `[Models] Creating session…` → 30s → `[Models] Error: Request timeout: initialize`）；
+//      ② `cachedModels` 只在**成功**时才写入 ⇒ 失败后依然为空 ⇒ 下一个请求原样重跑。
+//    ⇒ 修法必须两件一起做：给 SDK 调用加**本地超时**（不再让请求跟着 SDK 一起挂），
+//      并且**失败也记时间戳**（负缓存），否则"加了超时"只是把 30s 变成 8s，仍然每次重试。
+app.get("/api/models", async (req, res) => {
+  /** 拿不到 SDK 模型清单时的兜底（保持历史行为：这两个 id 一直是对外可见的默认项） */
+  const fallbackModels = [
+    { modelId: "claude-sonnet-4", name: "Claude Sonnet 4" },
+    { modelId: "claude-opus-4", name: "Claude Opus 4" },
+  ];
+  try {
+    const stale = Date.now() - modelsFetchedAt > MODELS_TTL_MS;
+    if (cachedModels.length === 0 && stale) {
+      // 先记时间戳再 await：并发的多个请求不会各起一个 SDK 会话
+      modelsFetchedAt = Date.now();
+      const sdkCall = (async () => {
+        const session = await unstable_v2_createSession({ cwd: process.cwd() });
+        return await session.getAvailableModels();
+      })();
+      // 给未胜出的那个 promise 挂个空 catch —— 否则它稍后 reject 会变成 unhandledRejection
+      sdkCall.catch(() => { /* 已被 race 淘汰，忽略 */ });
+      const models = (await Promise.race([
+        sdkCall,
+        new Promise((_, rej) => setTimeout(
+          () => rej(new Error(`拉取模型列表超时（${MODELS_FETCH_TIMEOUT_MS}ms）`)),
+          MODELS_FETCH_TIMEOUT_MS,
+        )),
+      ])) as Array<{ modelId: string; name: string }>;
+      if (Array.isArray(models) && models.length) cachedModels = models;
+    }
+    res.json({
+      models: cachedModels.length > 0 ? cachedModels : fallbackModels,
+      defaultModel,
+    });
+  } catch (error: any) {
+    // 失败方向是安全的：返回兜底列表（HTTP 200），不让模型下拉把整页带崩
+    console.warn('[Models] 拉取失败，返回兜底列表：', error?.message || error);
+    res.json({ models: fallbackModels, defaultModel, error: error?.message || String(error) });
+  }
+});
+
+// ============= 求职者档案 API =============
+
+app.get("/api/profile", (req, res) => {
+  try {
+    res.json({ profile: db.getProfile() });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取档案失败" });
+  }
+});
+
+app.put("/api/profile", (req, res) => {
+  try {
+    const incoming = req.body?.profile ?? req.body ?? {};
+    const merged = { ...db.getProfile(), ...incoming, updatedAt: new Date().toISOString() };
+    db.saveProfile(merged);
+    res.json({ success: true, profile: merged });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "保存档案失败" });
+  }
+});
+
+// ============= 邮箱验证码 API =============
+
+// 读取最新验证码
+app.get("/api/mail/code", async (req, res) => {
+  try {
+    const sinceMinutes = Number(req.query.sinceMinutes || 10);
+    const subjectKeyword = req.query.subjectKeyword as string | undefined;
+    const result = await fetchLatestCode({ sinceMinutes, subjectKeyword });
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || "读取验证码失败" });
+  }
+});
+
+// 最近邮件列表（排查用）
+app.get("/api/mail/recent", async (req, res) => {
+  try {
+    const limit = Number(req.query.limit || 10);
+    res.json(await listRecentMails(limit));
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || "读取邮件失败" });
+  }
+});
+
+// 获取邮箱配置（授权码脱敏）
+app.get("/api/mail/config", (req, res) => {
+  const cfg = db.getMailConfig();
+  res.json({
+    config: cfg
+      ? {
+          email: cfg.email,
+          imapHost: cfg.imap_host,
+          imapPort: cfg.imap_port,
+          useSsl: cfg.use_ssl === 1,
+          hasAuthCode: Boolean(cfg.auth_code),
+        }
+      : { email: '', imapHost: 'imap.qq.com', imapPort: 993, useSsl: true, hasAuthCode: false },
+  });
+});
+
+// 保存邮箱配置
+app.post("/api/mail/config", async (req, res) => {
+  try {
+    const { email, authCode, imapHost, imapPort, useSsl, test } = req.body || {};
+    if (!email) return res.status(400).json({ success: false, error: "邮箱地址不能为空" });
+
+    db.saveMailConfig({ email, authCode, imapHost, imapPort, useSsl });
+
+    if (test === false) {
+      return res.json({ success: true, message: "配置已保存" });
+    }
+    // 默认保存后立刻验证连通性
+    const result = await testConnection({ email, authCode, imapHost, imapPort, useSsl });
+    res.json(
+      result.ok
+        ? { success: true, message: `邮箱连接成功（${result.host}）`, test: result }
+        : { success: true, saved: true, warning: result.error, test: result }
+    );
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error?.message || "保存邮箱配置失败" });
+  }
+});
+
+// 测试邮箱连接
+app.post("/api/mail/test", async (req, res) => {
+  try {
+    const result = await testConnection(req.body || {});
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || "测试连接失败" });
+  }
+});
+
+// ============= 浏览器自动化 API =============
+
+app.post("/api/browser/exec", async (req, res) => {
+  try {
+    const { platform = 'default', action, ...args } = req.body || {};
+    if (!action) return res.status(400).json({ ok: false, error: "缺少 action 参数" });
+    res.json(await execAction(String(platform), String(action), args));
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || "浏览器操作失败" });
+  }
+});
+
+app.get("/api/browser/sessions", (req, res) => {
+  res.json({ sessions: listSessions() });
+});
+
+// 各平台「浏览器连接」状态（CDP 端口是否可达）：供控制台「自动识别有连接的投递」
+app.get("/api/browser/connections", async (req, res) => {
+  try {
+    res.json({ connections: await probePlatformConnections() });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "连接检测失败" });
+  }
+});
+
+app.post("/api/browser/close-all", async (req, res) => {
+  await closeAll();
+  res.json({ success: true });
+});
+
+// 浏览器自愈：检测所有管理端口，下线的一键按原 profile 拉起（登录态保留）。
+// 等价于把外部 ensure_chrome.sh 搬进服务进程，可经 API 触发，无需手动跑脚本。
+app.post("/api/browser/ensure-all", async (req, res) => {
+  try {
+    const result = await relaunchAll();
+    const up = Object.values(result).filter(Boolean).length;
+    res.json({ ok: true, result, up, total: Object.keys(result).length });
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || "浏览器拉起失败" });
+  }
+});
+
+// 浏览器端口健康诊断（只读，不拉起）。
+app.get("/api/browser/health", async (req, res) => {
+  try {
+    res.json({ ok: true, health: await checkAllHealth() });
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || "健康检查失败" });
+  }
+});
+
+// ============= 投递记录 API =============
+
+/**
+ * 投递台账分页上限。`limit` 是**客户端可控**参数，必须夹住 ——
+ * 否则一个 `?limit=999999999` 就把整库搬过网（本机表还不大，但这是接口级的坑）。
+ */
+const APPS_MAX_LIMIT = 2000;
+/**
+ * GET /api/applications
+ *   ?limit= 本页条数（**0 = 不分页，全量**；缺省 500，上限 APPS_MAX_LIMIT）
+ *   &offset= 跳过前几条
+ *   &platform= &status= 精确筛选（走 SQL，不再于应用层过滤）
+ * 回 `{ applications, total, limit, offset }`。
+ * 🔴 `total` 是**库内符合条件的总数**，不是本页条数。原来是 `list.length`，等于把
+ *    「截断后再筛选」的长度当总数报出去（恒 ≤ 500），界面照抄成「共 500 条」而库里
+ *    有 1087 条 —— 不报错、不告警，只是数字是错的。
+ */
+app.get("/api/applications", (req, res) => {
+  try {
+    const filter = {
+      platform: req.query.platform ? String(req.query.platform) : null,
+      status: req.query.status ? String(req.query.status) : null,
+    };
+    // 缺省 500 保持既有调用方的负载形状；显式 0（或负数）才是「我要全量」。
+    const rawLimit = req.query.limit === undefined ? 500 : Number(req.query.limit);
+    const limit = !Number.isFinite(rawLimit) ? 500
+      : rawLimit <= 0 ? 0
+        : Math.min(APPS_MAX_LIMIT, Math.floor(rawLimit));
+    const rawOffset = Number(req.query.offset);
+    const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+    const total = db.countApplications(filter);
+    const applications = db.listApplications(limit, offset, filter);
+    res.json({ applications, total, limit, offset });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取投递记录失败" });
+  }
+});
+
+/**
+ * GET /api/applications/stats —— 投递台账的聚合口径（SQL GROUP BY）。
+ * 控制台的四张统计卡、仪表盘三张卡、复盘页的阶段分布都从这里取数。
+ * 🔴 它们原先各自在浏览器里对**被截断的**数组 `for(...) cnt[k]++` 现数一遍，
+ *    所以那三处显示的数字从来就不只是「少了几条」，而是**错的** —— 且不会被任何门禁发现。
+ *    口径只有一份（db.applicationStatusCounts），页面不再自己算。
+ */
+app.get("/api/applications/stats", (req, res) => {
+  try {
+    const filter = {
+      platform: req.query.platform ? String(req.query.platform) : null,
+      status: req.query.status ? String(req.query.status) : null,
+    };
+    res.json({ total: db.countApplications(filter), byStatus: db.applicationStatusCounts(filter) });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取投递统计失败" });
+  }
+});
+
+app.post("/api/applications", (req, res) => {
+  try {
+    const { id, platform, company, position, salary, city, jobUrl, status, loginMethod, message } = req.body || {};
+    if (!platform) return res.status(400).json({ error: "platform 不能为空" });
+
+    const app_ = db.createApplication({
+      id: id || uuidv4(),
+      platform: String(platform),
+      company: company ?? null,
+      position: position ?? null,
+      salary: salary ?? null,
+      city: city ?? null,
+      job_url: jobUrl ?? null,
+      status: status || 'applied',
+      login_method: loginMethod ?? null,
+      message: message ?? null,
+    });
+    res.json({ application: app_ });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "创建投递记录失败" });
+  }
+});
+
+app.patch("/api/applications/:id", (req, res) => {
+  try {
+    const body = req.body || {};
+    const { platform, company, position, salary, city, jobUrl, status, loginMethod, message } = body;
+    // 流程时间节点：同时接受 snake_case（就是 /api/applications 回给前端的原始列名 ——
+    // 前端读到什么就写回什么，不必在前端再翻译一层）与 camelCase（沿用 jobUrl/loginMethod 的风格）。
+    // 两者都给时以 snake_case 为准；都不给 = undefined ⇒ 该列保持原值（部分更新语义）。
+    const pickTime = (snake: string, camel: string) => (body[snake] !== undefined ? body[snake] : body[camel]);
+    const success = db.updateApplication(req.params.id, {
+      platform, company, position, salary, city,
+      job_url: jobUrl, status, login_method: loginMethod, message,
+      written_at: pickTime('written_at', 'writtenAt'),
+      interview_at: pickTime('interview_at', 'interviewAt'),
+      interview_round: pickTime('interview_round', 'interviewRound'),
+      offer_at: pickTime('offer_at', 'offerAt'),
+      closed_at: pickTime('closed_at', 'closedAt'),
+    });
+    if (!success) return res.status(404).json({ error: "记录不存在" });
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "更新投递记录失败" });
+  }
+});
+
+app.delete("/api/applications/:id", (req, res) => {
+  try {
+    const success = db.deleteApplication(req.params.id);
+    if (!success) return res.status(404).json({ error: "记录不存在" });
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "删除投递记录失败" });
+  }
+});
+
+// ============= 简历解析 =============
+
+
+/* ---------------- 简历制作（D 批）：结构化草稿 + 出稿 ----------------
+ * 草稿存哪儿：`app_kv`，key 前缀 `resumedoc:` —— 复用既有的 kv 表，**零迁移**。
+ * 🔴 刻意**不**占用 `resume/原始|优化` 那两个版本位：它们是「投递时带哪份简历」的开关，
+ *    把制作台草稿混进去会让「简历版本」这个概念背上它不该管的语义（一份草稿不是可投递件）。
+ */
+const DOC_PREFIX = 'resumedoc:';
+const docKey = (id: string) => DOC_PREFIX + safeDocId(id);
+
+/** 简历制作页需要的**服务端常量**。
+ *  🔴 为什么连 `pdfVia` 一起下发：PDF 依赖 CDP，而「用哪个平台的浏览器排版」是后端的事。
+ *     前端若自己写死 `['official','boss']` 就是第二个真相源 —— 后端换端口映射、加平台时，
+ *     前端的「PDF 按钮是否可用」判断会静默失真（看着能点、点了才 503）。
+ *     配色白名单同理：抄一份前端，改一边漏一边就会渲染出不被承认的颜色。 */
+app.get("/api/resume/capabilities", (_req, res) => {
+  res.json({ accents: RESUME_ACCENTS, defaultAccent: DEFAULT_ACCENT_KEY,
+    variants: RESUME_VARIANTS, defaultVariant: DEFAULT_VARIANT_KEY, pdfVia: PDF_VIA_PLATFORMS });
+});
+
+app.get("/api/resume/docs", (_req, res) => {
+  try {
+    const items = db.kvKeysByPrefix(DOC_PREFIX).map((k) => {
+      const id = k.slice(DOC_PREFIX.length);
+      const d = db.kvGetJson<any>(k, null);
+      return d ? { id, title: String(d.title || ''), updatedAt: String(d.updatedAt || '') } : null;
+    }).filter(Boolean) as Array<{ id: string; title: string; updatedAt: string }>;
+    items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    res.json({ total: items.length, items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取草稿列表失败" });
+  }
+});
+
+app.get("/api/resume/docs/:id", (req, res) => {
+  try {
+    const id = safeDocId(req.params.id);
+    const d = db.kvGetJson<any>(docKey(id), null);
+    if (!d) return res.status(404).json({ error: '草稿不存在' });
+    res.json({ doc: sanitizeDoc(d) });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取草稿失败" });
+  }
+});
+
+/** 新建 / 保存。`PUT`（不是 POST）：id 由调用方给定，语义是「把这个 id 的内容设成这份」。 */
+app.put("/api/resume/docs/:id", (req, res) => {
+  try {
+    const id = safeDocId(req.params.id);
+    const prev = db.kvGetJson<any>(docKey(id), null);
+    // 🔴 必须过 sanitizeDoc：草稿直接来自 req.body，不规整就会被写进库再渲染进 PDF
+    //    （超长文本撑爆排版、theme.accent 任意串 = CSS 注入面）。
+    const doc = sanitizeDoc({ ...(req.body || {}), id }, prev || undefined);
+    db.kvSetJson(docKey(id), doc);
+    res.json({ ok: true, doc });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "保存草稿失败" });
+  }
+});
+
+/** 从当前档案起一份新草稿（基本信息不必重打一遍）。body: { id?, title? } */
+app.post("/api/resume/docs", (req, res) => {
+  try {
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    // 🔴 不能直接写 `safeDocId(req.body?.id) || <默认 id>`：safeDocId 对空输入返回 'doc'
+    //    （它必须永远吐一个可用的 id），**永远不会是假值** ⇒ 兜底分支永远走不到、
+    //    每份新草稿的 id 都恒为 'doc' ⇒ 建第二份必然 409「这个 id 已经有草稿了」。
+    const rawId = String(req.body?.id ?? '').trim();
+    const id = rawId ? safeDocId(rawId) : ('d' + Date.now().toString(36));
+    if (db.kvGetJson<any>(docKey(id), null)) return res.status(409).json({ error: '这个 id 已经有草稿了' });
+    const doc = { ...newDoc(id, profile), title: String(req.body?.title || '我的简历').slice(0, 60) };
+    db.kvSetJson(docKey(id), doc);
+    res.json({ ok: true, doc });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "新建草稿失败" });
+  }
+});
+
+app.delete("/api/resume/docs/:id", (req, res) => {
+  try {
+    const id = safeDocId(req.params.id);
+    if (!db.kvGetJson<any>(docKey(id), null)) return res.status(404).json({ error: '草稿不存在' });
+    db.kvDelete(docKey(id));
+    res.json({ ok: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "删除草稿失败" });
+  }
+});
+
+/** 出稿①：HTML —— **永远可用**（不依赖浏览器）。
+ *  🔴 刻意**不落盘**：草稿每敲一个字都会重渲染一次，落盘会在 data/ 堆一地中间产物，
+ *     还得再写一套清理。这里直接回字符串，前端用 iframe 的 srcdoc 预览、用 Blob 下载。 */
+app.post("/api/resume/docs/:id/html", (req, res) => {
+  try {
+    const id = safeDocId(req.params.id);
+    const d = db.kvGetJson<any>(docKey(id), null);
+    if (!d) return res.status(404).json({ error: '草稿不存在' });
+    // body.doc 有值时按「未保存的当前编辑内容」渲染（所见即所得），否则用库里那份
+    const doc = sanitizeDoc(req.body?.doc || d);
+    res.json({ ok: true, id: doc.id, title: doc.title, html: renderResumeDoc(doc) });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "渲染 HTML 失败" });
+  }
+});
+
+/** 出稿②：PDF —— **依赖 CDP**（借平台浏览器排版，与一岗一简历同一条通路）。
+ *  🔴 没有可用浏览器时返回 **503**（不是 500）：这是「依赖的浏览器不在线」，不是服务端坏了。
+ *     前端据此把按钮置灰并写明原因，而不是让用户点了才发现不能用。 */
+app.post("/api/resume/docs/:id/pdf", async (req, res) => {
+  try {
+    const id = safeDocId(req.params.id);
+    const d = db.kvGetJson<any>(docKey(id), null);
+    if (!d) return res.status(404).json({ error: '草稿不存在' });
+    const doc = sanitizeDoc(req.body?.doc || d);
+    fs.mkdirSync(RESUME_DOC_DIR, { recursive: true });
+    const htmlPath = path.join(RESUME_DOC_DIR, `${id}.html`);
+    const pdfPath = path.join(RESUME_DOC_DIR, `${id}.pdf`);
+    fs.writeFileSync(htmlPath, renderResumeDoc(doc), 'utf-8');
+    const r = await printHtmlToPdf(htmlPath, pdfPath);
+    if (!r.ok) return res.status(503).json({ ok: false, error: r.error, needPlatforms: PDF_VIA_PLATFORMS });
+    res.json({ ok: true, id, url: `/data/resume_doc/${id}.pdf` });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '生成 PDF 失败' });
+  }
+});
+
+app.post("/api/resume/parse", async (req, res) => {
+  try {
+    const { filePath } = req.body || {};
+    const profile = db.getProfile();
+    const target = filePath || profile?.resume_path;
+    if (!target) return res.status(400).json({ error: "未提供简历路径，请在「我的档案」中填写简历文件路径" });
+    const struct = await parseResumeFile(target);
+    // 解析出的技能同步回档案，便于投递时引用
+    if (struct.skills.length && profile) {
+      const prevSkills = (profile.skills as string) || '';
+      const merged = Array.from(new Set([...prevSkills.split(/[,，、]/).map(s => s.trim()).filter(Boolean), ...struct.skills]))
+        .filter(Boolean).join('，');
+      db.saveProfile({ ...profile, skills: merged });
+    }
+    res.json({
+      filePath: target,
+      name: struct.name,
+      phone: struct.phone,
+      email: struct.email,
+      skills: struct.skills,
+      education: struct.education,
+      experience: struct.experience,
+      projects: struct.projects,
+      rawTextLength: struct.rawText.length,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "简历解析失败" });
+  }
+});
+
+// ============= 岗位池（Offerbiu / 手动） =============
+
+/** 岗位池单次取数的硬顶（`?limit=` 之上限），否则 `?limit=999999999` 就把整库搬过网。 */
+const JOBS_MAX_LIMIT = 5000;
+
+/**
+ * GET /api/jobs
+ *   &source= &status=  精确筛选（走 SQL）
+ *   &sort= new（缺省，最新入库优先）| match（匹配分优先）
+ *   &limit= 本页条数（**0 = 不分页，全量**；缺省 0，上限 JOBS_MAX_LIMIT）
+ *   &offset= 跳过前几条（仅 limit > 0 时生效）
+ *   &ids=1&q=<关键词>  深搜模式：只在全库上找命中的 id（见 db.searchJobIds）
+ * 回 `{ jobs, total, limit, offset, sort, tagDefs }`。
+ *
+ * 🔴 三个修复点，全属「截断发生在筛选/排序之前」这一族：
+ *  ① `limit` 缺省从写死的 **1000** 改成 **0（全量）**。原来是 `params.push(opts.limit || 1000)`,
+ *     一个**与库大小无关的硬上限**：库里 2945 条时页面永远显示「1000 个岗位」。
+ *     连带受害者是下拉候选、快捷标签、筛选器禁用判断 —— 它们全从被切断的集合里推，于是
+ *     页面写出「岗位库里没有任何一条记录带标签」这种**与事实相反**的说明（库里 993 条带标签、
+ *     115 条带截止日），而「截止状态」下拉被误判成恒空并禁用。
+ *  ② `total` 改成 `db.countJobs()`（真数）。原来写 `list.length` —— 那是截断后的长度。
+ *  ③ 默认排序从「匹配分优先」改成「最新入库优先」。这不只是口味问题：旧排序是
+ *     `(match_score IS NULL), match_score DESC, created_at DESC LIMIT 1000`，库里有分的
+ *     1322 条恰好排满前 1000 名 ⇒ **所有还没评分的新岗位（1612 条）一条都进不来**。
+ *     实测：库里 `created_at` 最新的 10 条，在旧接口返回的 1000 条里命中 **0** 条。
+ *     （`?sort=match` 仍可拿回旧口径。）
+ *  ④ 响应体只回**轻量列**（`db.listJobsLean`，不含 jd/requirements/match_detail）。
+ *     全字段全量约 5.9 MiB，轻量约 1.7 MiB。要 jd 正文请走 `GET /api/jobs/:id`。
+ */
+app.get("/api/jobs", (req, res) => {
+  try {
+    const filter = {
+      source: req.query.source ? String(req.query.source) : undefined,
+      status: req.query.status ? String(req.query.status) : undefined,
+    };
+    const sort: db.JobSort = req.query.sort === 'match' ? 'match' : 'new';
+
+    // ── 深搜模式：JD 正文不搬过网，但「搜 JD 关键词」这个能力不能丢。
+    // 前端把命中的 id 当**并集**并进本地命中，所以这里多搜无害、少搜才会漏。
+    if (String(req.query.ids || '') === '1') {
+      const q = String(req.query.q || '');
+      const ids = db.searchJobIds(q, filter);
+      return res.json({ ids, matched: ids.length, total: db.countJobs(filter), q });
+    }
+    // 传了 q 却不在深搜模式 ⇒ 明确 400。静默忽略才是真麻烦：调用方会以为
+    // 「服务端按关键词筛过了」，实际拿到的是全量，然后拿全量去展示一个筛选后的界面。
+    if (req.query.q !== undefined) {
+      return res.status(400).json({
+        error: '按关键词取数请加 &ids=1（只回命中的 id）；本接口的 jobs 恒为全量/分页结果，不按 q 过滤',
+      });
+    }
+
+    const rawLimit = req.query.limit === undefined ? 0 : Number(req.query.limit);
+    const limit = !Number.isFinite(rawLimit) ? 0
+      : rawLimit <= 0 ? 0
+        : Math.min(JOBS_MAX_LIMIT, Math.floor(rawLimit));
+    const rawOffset = Number(req.query.offset);
+    const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+
+    const total = db.countJobs(filter);
+    const jobs = db.listJobsLean({ ...filter, limit, offset, sort });
+    // tagDefs：「校招信息库」快捷关注标签的定义（key / label / hint）。
+    // 由服务端下发而不是前端再抄一份 —— 抄一份就是第二个真相源，改一边忘一边时
+    // 前端会渲染出后端根本不认识的标签，点下去恒 0 条且没有任何地方会报错。
+    // 前端只用它拿「展示顺序 + 文案」，**是否渲染某个标签仍由数据实测值决定**（count > 0）。
+    res.json({ jobs, total, limit, offset, sort, tagDefs: CARD_UI_TAGS });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取岗位失败" });
+  }
+});
+
+/** 已抓取 JD 长图的岗位列表（微信校招推文：JD 是图片，供人工查看真实岗位内容） */
+app.get("/api/jobs/image-jd", (req, res) => {
+  try {
+    /**
+     * 入参 `jobId`（可选）：
+     *   不带 ⇒ 返回最近 500 条有长图的岗位（控制台「长图」下拉用）。
+     *   带上 ⇒ 只返回该岗位（控制台在职位详情里点「长图」用；避免把 248 条搬过网再前端 filter）。
+     */
+    const jobId = String(req.query.jobId || '').trim();
+    const baseSql = "SELECT id, company, position, jd_images FROM jobs WHERE jd_source='image' AND jd_images IS NOT NULL AND TRIM(jd_images)<>''";
+    const rows = jobId
+      ? db.query<{ id: string; company: string | null; position: string | null; jd_images: string | null }>(
+          baseSql + ' AND id = ?', [jobId])
+      : db.query<{ id: string; company: string | null; position: string | null; jd_images: string | null }>(
+          baseSql + ' ORDER BY updated_at DESC LIMIT 500');
+
+    /**
+     * 🔴 返回 `images`（已是可直接塞进 `<img src>` 的 URL 数组），而不是原来的 `image`（单张裸路径）。
+     *
+     * 为什么这么改（2026-10-11 实测，三处不匹配叠加导致「长图」功能恒空白）：
+     *   ① 后端返回 `{total, items}`，控制台读的是 **`r.jobs`** ⇒ 恒 undefined ⇒ [];
+     *   ② 后端给 `image`（单张字符串），控制台要 **`jd_images`**（JSON 数组串）⇒ 名字与形态都不对；
+     *   ③ `data/jd_images` 当时**没有静态挂载** ⇒ 即便上面两条对了，`<img>` 也是 404。
+     * 现在：后端一次给全（解析 + 签名 + 全部图片），前端只负责渲染。
+     * 签名不能省：局域网（HOST=0.0.0.0）下 `/data/jd_images/*` 属于受保护静态资源，
+     * 裸路径会被 401（见 `authToken.SIGNED_PATH_PREFIXES`）。
+     */
+    const items = rows.map((r) => {
+      let images: string[] = [];
+      try {
+        images = (JSON.parse(r.jd_images || '[]') as Array<{ local?: string }>)
+          .map((x) => String(x?.local || ''))
+          .filter(Boolean)
+          .map((p) => signStaticPath(p));
+      } catch { /* 坏 JSON：当成没有长图，别让一条坏记录把整个接口打挂 */ }
+      return { id: r.id, company: r.company, position: r.position, images };
+    }).filter((x) => x.images.length);
+    res.json({ total: items.length, items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "查询失败" });
+  }
+});
+
+/** 远程岗位统计（对标 Resumly「远程岗位筛选」） */
+app.get("/api/jobs/remote-stat", (_req, res) => {
+  try {
+    const rows = db.query<{ remote: number | null }>("SELECT remote FROM jobs");
+    let remote = 0, nonRemote = 0, unknown = 0;
+    for (const r of rows) {
+      if (r.remote === 1) remote++;
+      else if (r.remote === 0) nonRemote++;
+      else unknown++;
+    }
+    res.json({ total: rows.length, remote, nonRemote, unknown });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "查询失败" });
+  }
+});
+
+/** 存量岗位远程标记回填：对所有 remote 为 NULL 的岗位按文本重新识别 */
+app.post("/api/jobs/backfill-remote", (_req, res) => {
+  try {
+    const r = db.backfillRemoteJobs();
+    res.json({ ok: true, scanned: r.scanned, updated: r.updated });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "回填失败" });
+  }
+});
+
+/** 微信图片JD 的 OCR 回填状态统计（按 ocr_status 分组 + 待处理量） */
+app.get("/api/jobs/ocr-status", (_req, res) => {
+  try {
+    const rows = db.query<{ ocr_status: string | null; c: number }>(
+      "SELECT COALESCE(ocr_status,'pending') ocr_status, COUNT(*) c FROM jobs WHERE jd_source='image' GROUP BY ocr_status",
+    );
+    const stat: Record<string, number> = { pending: 0, done: 0, failed: 0 };
+    for (const r of rows) stat[r.ocr_status ?? 'pending'] = r.c;
+    res.json({ ...stat, imageTotal: stat.pending + stat.done + stat.failed });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "查询失败" });
+  }
+});
+
+/** 触发微信图片JD 的 OCR 回填（后台 spawn 脚本，立即返回 pending 量，进度见运行日志/报告） */
+app.post("/api/jobs/ocr-backfill", (req, res) => {
+  try {
+    const body = (req.body || {}) as { limit?: number; model?: string; retryFailed?: boolean };
+    const args: string[] = [];
+    if (body.limit) args.push("--limit", String(body.limit));
+    if (body.model) args.push("--model", String(body.model));
+    if (body.retryFailed) args.push("--retry-failed");
+    const child = spawn(process.execPath, ["node_modules/tsx/dist/cli.mjs", "scripts/ocr_wechat_jd.ts", ...args], {
+      cwd: path.join(__dirname, ".."),
+      detached: false,
+      stdio: "ignore",
+    });
+    child.on("error", (e) => console.error("[ocr-backfill] spawn 失败:", e.message));
+    const pending = db.query<{ c: number }>(
+      "SELECT COUNT(*) c FROM jobs WHERE jd_source='image' AND (jd IS NULL OR TRIM(jd)='') AND (ocr_status IS NULL OR ocr_status='pending')",
+    )[0]?.c || 0;
+    res.json({ ok: true, pending, started: true, note: "已在后台启动，稍后到「职位记录」查看识别结果，或 GET /api/jobs/ocr-status 看进度" });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "启动失败" });
+  }
+});
+
+// ── 运行日志 / OCR 失败明细（供控制台「运行日志」视图，只读） ──
+const OCR_FAILED_DIR = path.join(__dirname, "..", "data", "ocr_failed");
+
+app.get("/api/logs/run", (req, res) => {
+  try {
+    const qRaw = String(req.query.q || "").trim();
+    const q = qRaw.toLowerCase();
+    const level = String(req.query.level || "").trim().toUpperCase();
+    const limit = Math.min(2000, Number(req.query.limit) || 500);
+    let dates: string[] = [];
+    try {
+      dates = fs.readdirSync(RUN_LOG_DIR).filter((f) => f.endsWith(".log")).map((f) => f.replace(/\.log$/, "")).sort().reverse();
+    } catch { /* 尚无日志目录 */ }
+    const date = String(req.query.date || "").trim() || dates[0] || "";
+    const lines: Array<{ ts: string; level: string; msg: string }> = [];
+    if (date) {
+      const fp = path.join(RUN_LOG_DIR, date + ".log");
+      if (fs.existsSync(fp)) {
+        for (const ln of fs.readFileSync(fp, "utf-8").split("\n")) {
+          const m = ln.match(/^\[([^\]]+)\]\s*\[([A-Z]+)\]\s*(.*)$/);
+          if (!m) continue;
+          const rec = { ts: m[1], level: m[2], msg: m[3] };
+          if (level && rec.level !== level) continue;
+          if (q && !(rec.msg.toLowerCase().includes(q) || rec.ts.toLowerCase().includes(q))) continue;
+          lines.push(rec);
+        }
+      }
+    }
+    lines.reverse(); // 最新在前
+    res.json({ dates, date, level, q: qRaw, total: lines.length, lines: lines.slice(0, limit) });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取运行日志失败" });
+  }
+});
+
+app.get("/api/logs/ocr-failed", (req, res) => {
+  try {
+    const qRaw = String(req.query.q || "").trim();
+    const q = qRaw.toLowerCase();
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(OCR_FAILED_DIR).filter((f) => f.endsWith(".txt"));
+    } catch { /* 尚无失败明细 */ }
+    const MAX = 4000;
+    const items: Array<{ jobId: string; company: string; position: string; chars: number; at: string; text: string; truncated: boolean }> = [];
+    for (const f of files) {
+      const jobId = f.replace(/\.txt$/, "");
+      let text = "";
+      let at = "";
+      try {
+        const fp = path.join(OCR_FAILED_DIR, f);
+        text = fs.readFileSync(fp, "utf-8");
+        at = new Date(fs.statSync(fp).mtimeMs).toISOString();
+      } catch { continue; }
+      let company = "";
+      let position = "";
+      try {
+        const row = db.query<{ company: string; position: string }>("SELECT company, position FROM jobs WHERE id=?", [jobId])[0];
+        company = row?.company || "";
+        position = row?.position || "";
+      } catch { /* 忽略 */ }
+      if (q && !(`${company} ${position} ${text}`.toLowerCase().includes(q))) continue;
+      items.push({ jobId, company, position, chars: text.length, at, text: text.slice(0, MAX), truncated: text.length > MAX });
+    }
+    items.sort((a, b) => (a.at < b.at ? 1 : -1));
+    res.json({ total: items.length, q: qRaw, items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取 OCR 失败明细失败" });
+  }
+});
+
+app.get("/api/logs/summary", (req, res) => {
+  try {
+    const days = Math.min(14, Math.max(1, Number(req.query.days) || 1));
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(RUN_LOG_DIR).filter((f) => f.endsWith(".log")).sort().reverse().slice(0, days);
+    } catch { /* 尚无日志目录 */ }
+    let total = 0;
+    const errs: Array<{ ts: string; msg: string }> = [];
+    for (const f of files) {
+      try {
+        for (const ln of fs.readFileSync(path.join(RUN_LOG_DIR, f), "utf-8").split("\n")) {
+          const m = ln.match(/^\[([^\]]+)\]\s*\[([A-Z]+)\]\s*(.*)$/);
+          if (!m) continue;
+          total++;
+          if (m[2] === "ERROR") errs.push({ ts: m[1], msg: m[3] });
+        }
+      } catch { /* 跳过单个文件 */ }
+    }
+    errs.sort((a, b) => (a.ts < b.ts ? 1 : -1));
+    let ocrFailed = 0;
+    try {
+      ocrFailed = fs.readdirSync(OCR_FAILED_DIR).filter((f) => f.endsWith(".txt")).length;
+    } catch { /* 忽略 */ }
+    res.json({ days, files: files.length, total, errors: errs.length, lastError: errs[0] || null, ocrFailed, alert: alertStatus() });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取日志摘要失败" });
+  }
+});
+
+// 主动发一封测试告警邮件，验证「运行异常 → 邮件提醒」链路是否打通
+app.post("/api/logs/alert-test", async (_req, res) => {
+  try {
+    const r = await sendTestAlert();
+    if (!r.ok) return res.status(400).json({ error: r.error || "发送失败", to: r.to || null });
+    res.json({ ok: true, to: r.to, note: "测试告警已发送，请查收邮箱（含垃圾箱）" });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "发送测试告警失败" });
+  }
+});
+
+app.post("/api/jobs", (req, res) => {
+  try {
+    const { id, source, company, position, city, jd, requirements, salary, applyUrl, deadline, jobType, gradYear, tags } = req.body || {};
+    if (!company && !position) return res.status(400).json({ error: "company / position 至少填一个" });
+    // gradYear / tags 是可选的**显式覆盖**：表单里没填就传 undefined，
+    // upsertJob 会退回「从卡片文本派生」（见 db.ts 的卡片元数据段）。
+    const job = db.upsertJob({
+      id, source, company: company ?? null, position: position ?? null, city: city ?? null,
+      jd: jd ?? null, requirements: requirements ?? null, salary: salary ?? null,
+      apply_url: applyUrl ?? null, deadline: deadline ?? null, job_type: jobType ?? null,
+      grad_year: gradYear, tags,
+    });
+    res.json({ job });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "创建岗位失败" });
+  }
+});
+
+app.patch("/api/jobs/:id", (req, res) => {
+  try {
+    // 🔴 2026-09-30：这里原先是 `db.updateJob(req.params.id, req.body || {})` —— 整包转发。
+    // 配合 db.updateJob 里「用 Object.keys(updates) 拼列名」的老写法，构成**列名注入**：
+    // 实测 body = { "company = 'X', position = ?, city = ?, salary = ? --": "P" } 会拼出
+    //   UPDATE jobs SET company = 'X', position = ?, city = ?, salary = ? -- = ?, updated_at = ? WHERE id = ?
+    // `--` 注释掉 WHERE，**全表被改写**，接口还静默返回 200。
+    //
+    // 两道防线（各自独立成立）：
+    //   ① db.updateJob 内部已改为**按列名白名单遍历**（键名不可能来自 body）；
+    //   ② 这里再按同一份清单（JOB_UPDATABLE，唯一真相源在 db.ts）**显式挑字段**，
+    //      未知键直接丢弃 —— 保留旧客户端「多传字段也不报错」的兼容性。
+    // 顺带修掉一个误导：原先「没有可更新字段」也走 `return false`，
+    // 与「岗位不存在」共用同一条 404，空 body 会被报成「岗位不存在」。
+    const body = (req.body || {}) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const k of db.JOB_UPDATABLE) {
+      if (body[k] !== undefined) patch[k] = body[k];
+    }
+    if (Object.keys(patch).length === 0) {
+      if (!db.getJob(String(req.params.id))) return res.status(404).json({ error: "岗位不存在" });
+      return res.status(400).json({ error: "没有可更新的字段" });
+    }
+    const ok = db.updateJob(req.params.id, patch as any);
+    if (!ok) return res.status(404).json({ error: "岗位不存在" });
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "更新岗位失败" });
+  }
+});
+
+app.delete("/api/jobs/:id", (req, res) => {
+  try {
+    const ok = db.deleteJob(req.params.id);
+    if (!ok) return res.status(404).json({ error: "岗位不存在" });
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "删除岗位失败" });
+  }
+});
+
+// 用简历对岗位池批量打分并排序
+//
+// 🔴 2026-10-11 审计：原实现有三个叠加的无界点 ——
+//   ① 入参只有 `{filePath, source, status}`，**不收 jobIds、不接受 limit**；
+//   ② `db.listJobs()` 只在 `opts.limit > 0` 时才加 `LIMIT` ⇒ 不传 source/status 时**取全表**
+//      （实测 3263 条）；即便传了 `{source:'boss'}` 也还有 1393 条；
+//   ③ 对每条调 `matchResumeToJobAi()`，且 `Promise.all` **无并发上限**
+//      ⇒ 一次调用 = 数千次 LLM 请求 + 数千并发 socket（本机先被自己打挂）。
+//    ⇒ 现在：4 路并发池 + `limit` 上限 + 默认跳过已打分（要重打传 `force:true`）；
+//      并且把 `matched` / `remaining` / `skippedScored` 一并回给调用方，
+//      「只打了一部分」必须是**看得见的**，不能静默截断（见 /api/applications 那次分页修复）。
+app.post("/api/jobs/match", async (req, res) => {
+  try {
+    const { filePath, source, status, force } = req.body || {};
+    /** 单次最多打多少条（默认 500，上限 2000）——防止一次调用把整库搬去喂 LLM */
+    const limit = Math.min(Math.max(1, Number(req.body?.limit) || 500), 2000);
+    /** LLM 并发上限：4 路足够快，又不会把对端与本机连接数打爆 */
+    const CONCURRENCY = 4;
+    const profile = db.getProfile();
+    const target = filePath || profile?.resume_path;
+    if (!target) return res.status(400).json({ error: "未配置简历路径，无法匹配。请先在「我的档案」填写简历文件路径，或请求中带 filePath" });
+    const struct = await parseResumeFile(target);
+    const all = db.listJobs({ source: source as string, status: status as string });
+    // 无 JD 文本的岗位**不送 LLM**：规则引擎与 AI 都评不出来（见 match.ts 的 basis:'none'），
+    // 白花钱且会写出无意义的 0 分。口径与 batch.ts:487 一致（那边早就「无 JD 文本 → 跳过且不写库」）。
+    // 阈值 10 与 match.ts 的 `corpus.length < 10` 对齐，避免两处口径漂移。
+    const evaluable = all.filter((j) => `${(j as any).jd || ''}\n${(j as any).requirements || ''}`.trim().length >= 10);
+    const skippedNoJd = all.length - evaluable.length;
+    // 默认跳过已打分的（不重复付费）；`force:true` 恢复"全部重打"的旧行为
+    const pool = force === true ? evaluable : evaluable.filter((j) => (j as any).match_score == null);
+    const skippedScored = evaluable.length - pool.length;
+    const jobs = pool.slice(0, limit);
+    const remaining = pool.length - jobs.length;
+
+    const ranked: Array<any> = new Array(jobs.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= jobs.length) return;
+        const job = jobs[i];
+        try {
+          const r = await matchResumeToJobAi({ resumeBlob: struct.searchBlob, resumeSkills: struct.skills, jd: job.jd || '', requirements: job.requirements || '', position: job.position || '' });
+          // score 为 null = 无法评估（正常不会走到：上面的 evaluable 已滤掉无 JD 文本的岗位）。
+          // 不写库，保持 NULL —— 免得又把「没得评」固化成 0 分。
+          if (r.score != null) {
+            db.updateJob(job.id, { match_score: r.score, match_detail: JSON.stringify({ matched: r.matched, missing: r.missing, suggestions: r.suggestions }), matched_at: new Date().toISOString() });
+          }
+          ranked[i] = { ...job, match_score: r.score, match_detail: { matched: r.matched, missing: r.missing, suggestions: r.suggestions } };
+        } catch (e: any) {
+          // 单条失败不能让整批断掉（原来 Promise.all 一炸全炸，且已写入的分数留在库里、响应却 500）
+          console.warn(`[match] 岗位 ${job.id} 打分失败：${e?.message || e}`);
+          ranked[i] = { ...job, match_score: null, match_error: e?.message || String(e) };
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(CONCURRENCY, jobs.length)) }, worker));
+
+    const out = ranked.filter(Boolean);
+    out.sort((a, b) => (b.match_score ?? -1) - (a.match_score ?? -1));
+    res.json({
+      resumeName: struct.name,
+      skills: struct.skills,
+      total: out.length,
+      jobs: out,
+      /** 本次实际打分条数 */
+      matched: out.length,
+      /** 因 `limit` 未处理、需要再调一次才能覆盖的条数（0 表示已覆盖完） */
+      remaining,
+      /** 因已有分数被跳过的条数（`force:true` 可为 0） */
+      skippedScored,
+      /** 因无 JD 文本而无法评估、被排除在打分之外的条数（这些岗位的 match_score 保持 NULL） */
+      skippedNoJd,
+      note: remaining > 0
+        ? `本次只处理了 ${out.length} 条（limit=${limit}），还有 ${remaining} 条未打分；请再调一次，或显式传更大的 limit。`
+        : undefined,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "匹配失败" });
+  }
+});
+
+/** 单岗位 AI 匹配（「AI 匹配」页面用）。
+ *  与 /api/jobs/match 的区别：那个是**全量**打分（对岗位池里每个岗位都调一次 AI，慢且贵），
+ *  这里只针对**一个**岗位 —— 岗位池里的 jobId，或用户当场粘贴的 JD。
+ *  入参：{ jobId } 或 { jd, position, company }；可选 filePath 覆盖简历底稿。 */
+app.post("/api/jobs/match-one", async (req, res) => {
+  try {
+    const { jobId, jd, position, company, filePath, version } = req.body || {};
+    const profile = db.getProfile();
+    // 简历底稿优先级：显式 filePath > 请求指定的「简历版本」解析结果 > 档案里的 resume_path。
+    // 用版本解析（而不是永远拿 resume_path）才有意义 —— 否则页面上那个「选择简历」下拉是假的：
+    // 切了版本分数却一模一样，而且**不报任何错**。
+    const byVersion = version ? resolveResumeForVersion(profile, String(version) as any) : undefined;
+    const target = filePath || byVersion || profile?.resume_path;
+    if (!target) return res.status(400).json({ error: "未配置简历，请先在「简历管理」上传简历" });
+    let j: { company: string | null; position: string | null; jd: string | null; requirements: string | null };
+    if (jobId) {
+      const row = db.getJob(String(jobId));
+      if (!row) return res.status(404).json({ error: "岗位不存在" });
+      j = { company: row.company, position: row.position, jd: row.jd, requirements: row.requirements };
+    } else {
+      j = { company: company ?? null, position: position ?? null, jd: jd ?? null, requirements: null };
+    }
+    if (!j.jd && !j.position) return res.status(400).json({ error: "请提供岗位：jobId，或 jd / position" });
+    const struct = await parseResumeFile(target);
+    const r = await matchResumeToJobAi({
+      resumeBlob: struct.searchBlob, resumeSkills: struct.skills,
+      jd: j.jd || '', requirements: j.requirements || '', position: j.position || '',
+    });
+    // 岗位池里的岗位顺手把分数写回（与全量匹配同一口径）；当场粘贴的 JD 无行可写，不落库
+    if (jobId) {
+      db.updateJob(String(jobId), {
+        match_score: r.score,
+        match_detail: JSON.stringify({ matched: r.matched, missing: r.missing, suggestions: r.suggestions }),
+        matched_at: new Date().toISOString(),
+      });
+    }
+    res.json({
+      ok: true, resumeName: struct.name, skills: struct.skills,
+      // resumeFile / resumeVersion 一并回传：UI 要能如实告诉用户「这一次用的是哪份简历」
+      resumeFile: target, resumeVersion: version ? String(version) : getResumeVersion(),
+      job: { id: jobId ? String(jobId) : null, company: j.company, position: j.position },
+      score: r.score, matched: r.matched, missing: r.missing, suggestions: r.suggestions,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "匹配失败" });
+  }
+});
+
+/** 一岗一简历：按目标岗位 JD 定制简历片段（LLM 优先，失败回退本地规则）。
+ *  入参：{ jobId } 取岗位池中的岗位；或直接传 { job: {position, company, jd, requirements} }。
+ *  产出：定制「核心优势」+ 技能按岗位相关度重排 + 命中/待补分析 + Markdown。 */
+app.post("/api/jobs/tailor", async (req, res) => {
+  try {
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    let job = req.body?.job;
+    if (!job && req.body?.jobId) {
+      const j = db.getJob(String(req.body.jobId));
+      if (!j) return res.status(404).json({ error: "岗位不存在" });
+      job = { id: j.id, company: j.company, position: j.position, jd: j.jd, requirements: j.requirements };
+    }
+    if (!job) return res.status(400).json({ error: "请提供 jobId 或 job 对象" });
+    const result = await tailorResume(profile, job);
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "定制失败" });
+  }
+});
+
+// 从 Offerbiu 校招信息库采集岗位（需用户已在该浏览器上下文登录；采集结果入库为岗位池）
+app.post("/api/offerbiu/collect", async (req, res) => {
+  try {
+    // pages：翻页数（实测 /companies/ 共 912 页 / 8201 条；默认只采第 1 页）
+    const { limit = 50, pages = 1 } = req.body || {};
+    const result = await collectOfferbiu(Number(limit) || 50, Number(pages) || 1);
+    res.json({ collected: result.collected, jobs: result.jobs });
+  } catch (error: any) {
+    if (coreRequiredReplied(error, res)) return;
+    const status = /尚未登录/.test(error?.message || '') ? 401 : 500;
+    res.status(status).json({ error: error?.message || '采集失败' });
+  }
+});
+
+// 记录「当前官网页面」的表单字段到记忆（按域名）：人工补填后调用，下次同站自动填写
+// ctx 指定读取哪个浏览器上下文的当前页：'official'（offerbiu 官网窗口，默认）/ 'wangshen'（网申窗口）
+app.post("/api/offerbiu/remember-form", async (req, res) => {
+  try {
+    const ctx = (req.body && req.body.ctx) || 'official';
+    const r = await rememberCurrentForm(ctx);
+    res.json({ ok: true, site: r.site, saved: r.saved, fields: r.fields, logs: r.logs });
+  } catch (error: any) {
+    if (coreRequiredReplied(error, res)) return;
+    res.status(500).json({ ok: false, error: error?.message || '记录失败' });
+  }
+});
+
+// 按关键词采集 offerbiu 岗位（利用列表页搜索框精准筛选：匿名也能拿到大量对口岗位）
+
+// 表单记忆列表 / 删除（「自动填充」页用）。
+// 只回「域名 + 字段标签 + 条数」，**不回值** —— 值是姓名 / 手机号 / 邮箱，属个人信息，
+// 摊在界面上等于把 PII 暴露给所有能看到屏幕的人。
+// ⚠️ 刻意用 POST：非回环部署时只有写方法走令牌鉴权，GET 免鉴权 ⇒
+//    做成 GET 等于给同网段的任何人开了个读候选人表单的口子。
+app.post("/api/offerbiu/form-memory/list", (_req, res) => {
+  try {
+    res.json({ ok: true, items: db.listFormMemory() });
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || '读取表单记忆失败' });
+  }
+});
+
+app.post("/api/offerbiu/form-memory/delete", (req, res) => {
+  const site = String((req.body && req.body.site) || '').trim();
+  if (!site) return res.status(400).json({ ok: false, error: 'site 不能为空' });
+  try {
+    // 走参数化 exec：site 来自请求体，绝不能拼进 SQL 字符串（列名/值注入）
+    res.json({ ok: true, removed: db.deleteFormMemory(site) });
+  } catch (error: any) {
+    res.status(500).json({ ok: false, error: error?.message || '删除表单记忆失败' });
+  }
+});
+app.post("/api/offerbiu/collect-keywords", async (req, res) => {
+  try {
+    const { keywords, pagesPerKeyword = 3, perKeyword = 27 } = req.body || {};
+    const kws: string[] = Array.isArray(keywords)
+      ? keywords.map((k: unknown) => String(k)).filter(Boolean)
+      : String(keywords || '').split(/[,，、;；\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (!kws.length) return res.status(400).json({ error: 'keywords 不能为空' });
+    const r = await collectOfferbiuByKeywords(kws, {
+      pagesPerKeyword: Number(pagesPerKeyword) || 3,
+      perKeyword: Number(perKeyword) || 27,
+    });
+    res.json({ collected: r.collected, perKeyword: r.perKeyword });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '关键词采集失败' });
+  }
+});
+
+// ============= 邮箱直投（无需登录：微信推文 / 企业官网表单上的招聘邮箱） =============
+//
+// 🔴 范围**不再限定 offerbiu**：微信推文(292) 与纯官网表单(626) 固然都在 offerbiu 池内，
+//    但同类岗位也会从别的平台采进来（实测「jd 带邮箱」的 104 个岗位里 chinahr 占 35）。
+//    判据是「apply_url 不在招聘平台自有域上」，与 source 无关。
+
+/**
+ * 扫描微信推文 / 官网表单岗位的招聘邮箱（SSE：开头 pool + 进度 + 末尾 found）。
+ *
+ * 入参：limit / offset / workers / settleMs / hrLikeOnly（原有）
+ *      scope:      'all' | 'wechat' | 'site'（岗位范围）
+ *      source:     可选 source 白名单（不传即全平台）
+ *      hasJdOnly:  只处理库内 JD 正文非空的岗位
+ *      jdOnly:     **只用 JD 正文提邮箱、不开浏览器**（零网络成本；微信推文正文在图片里，开页面也抓不到）
+ */
+app.post("/api/offerbiu/scan-emails", async (req, res) => {
+  const { limit, offset, hrLikeOnly, settleMs, workers, hasJdOnly, jdOnly } = req.body || {};
+  const scopeRaw = String((req.body || {}).scope || 'all');
+  const scope: EmailScanScope = scopeRaw === 'wechat' || scopeRaw === 'site' ? scopeRaw : 'all';
+  const source = (req.body || {}).source ? String(req.body.source) : undefined;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const send = (e: unknown) => { res.write(`data: ${JSON.stringify(e)}\n\n`); };
+  try {
+    // 先报岗位池覆盖：让「扫出来是 0」这件事有解释（池里没有 JD 正文 / 推文还没跑 OCR），
+    // 而不是让用户对着一个空列表猜。
+    send({ type: 'pool', pool: emailPoolStats(scope, source) });
+    // 带上档案：扫描结果里就能预览**最终邮件标题**，让用户在点投递之前
+    // 看见招聘方要求什么、我们会发什么（2026-10-10：旧解析器在真库 14 条里只中 1 条）
+    const scanProfile = (db.getProfile() as Record<string, any>) || {};
+    const r = await scanOfferbiuEmails({
+      limit: Number(limit) || 20,
+      offset: Number(offset) || 0,
+      hrLikeOnly: hrLikeOnly !== false,
+      settleMs: settleMs ? Number(settleMs) : undefined,
+      workers: workers ? Number(workers) : 1,
+      scope,
+      source,
+      hasJdOnly: hasJdOnly === true,
+      jdOnly: jdOnly === true,
+      profile: toApplyProfile(scanProfile) as any,
+      onProgress: (ev: ScanProgress) => send(ev),
+    });
+    send({ type: 'found', scanned: r.scanned, found: r.found, pool: r.pool, sharedDropped: r.sharedDropped });
+    res.write('event: end\ndata: {}\n\n');
+  } catch (error: any) {
+    // SSE 已提交响应头 ⇒ 回不了 501；翻译成友好文案，别把 CORE_UNAVAILABLE: <内部路径> 吐给用户
+    send({ type: 'error', message: isCoreUnavailable(error) ? CORE_REQUIRED_MESSAGE : (error?.message || '扫描失败') });
+  } finally {
+    res.end();
+  }
+});
+
+
+/** 简历定制历史（**只读**：扫 data/resume_tailored/ 的 json 台账）。
+ *  ⚠️ 为什么只能读磁盘：`/api/jobs/tailor`（正文定制）与 `/api/jobs/tailor-resume`（出 PDF）
+ *    都只往 data/resume_tailored/ 写 `<公司>-<职位>-<hash>.{json,html,pdf}` 三个文件，
+ *    **一条记录都没进库** ⇒ 想在个人中心看到「我为哪些岗位优化过简历」，只能扫目录。
+ *  安全：名字来自 readdirSync（不含路径分隔符），只回 basename 拼成的静态 URL，不回绝对路径。
+ *  容错：单个 json 损坏/半成品只跳过该文件，不让一条坏记录把整个接口打挂。 */
+app.get("/api/resume/tailored-history", (_req, res) => {
+  try {
+    if (!fs.existsSync(TAILORED_DIR)) return res.json({ total: 0, items: [] });
+    const items: Array<Record<string, any>> = [];
+    for (const f of fs.readdirSync(TAILORED_DIR)) {
+      if (!f.endsWith('.json')) continue;
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(TAILORED_DIR, f), 'utf8')) || {};
+        const base = f.slice(0, -'.json'.length);
+        items.push({
+          file: base,
+          company: String(j.company || ''),
+          position: String(j.position || ''),
+          matchScore: typeof j.matchScore === 'number' ? j.matchScore : null,
+          source: String(j.source || ''),
+          jobId: String(j.jobId || ''),
+          generatedAt: String(j.generatedAt || ''),
+          // 产物是否还在：json 在但 pdf/html 可能已被清理策略删掉 ⇒ 前端据此不给死链
+          hasPdf: fs.existsSync(path.join(TAILORED_DIR, base + '.pdf')),
+          hasHtml: fs.existsSync(path.join(TAILORED_DIR, base + '.html')),
+          url: `/data/resume_tailored/${base}.pdf`,
+        });
+      } catch {
+        /* 坏 json：跳过 */
+      }
+    }
+    items.sort((a, b) => String(b.generatedAt).localeCompare(String(a.generatedAt)));
+    res.json({ total: items.length, items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取定制历史失败" });
+  }
+});
+
+/** 一岗一简历：为指定岗位生成「按 JD 定制」的简历 PDF，返回路径与定制摘要。
+ *  入参 { jobId } 或 { job }；force=true 强制重生成。
+ *  产出文件在 data/resume_tailored/，可作为投递附件（email-apply 传 tailor:true 会自动调用本逻辑）。 */
+app.post("/api/jobs/tailor-resume", async (req, res) => {
+  try {
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    let job = req.body?.job;
+    if (!job && req.body?.jobId) {
+      const j = db.getJob(String(req.body.jobId));
+      if (!j) return res.status(404).json({ error: '岗位不存在' });
+      job = { id: j.id, company: j.company, position: j.position, jd: j.jd, requirements: j.requirements };
+    }
+    if (!job) return res.status(400).json({ error: '请提供 jobId 或 job 对象' });
+    const r = await ensureTailoredResumePdf(job, { profile, force: req.body?.force === true });
+    if (!r.ok) return res.status(500).json(r);
+    res.json({ ...r, url: `/data/resume_tailored/${path.basename(r.pdfPath!)}` });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '定制简历生成失败' });
+  }
+});
+
+/** 打招呼决策（对标同类产品 /api/ai/checkAutoChat，但我们返回可读理由）
+ *  入参：{ jobId } 或 { jobIds: [] }；apply=true 时把 skip_reason 落到 jobs 表。
+ *  决策顺序：硬规则（已回复/已写过/已投过/不可投/隔离/排除词/城市/匹配度）→ AI → 兜底。 */
+app.post("/api/jobs/greet-decision", async (req, res) => {
+  try {
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    const opts = {
+      minScore: req.body?.minScore !== undefined ? Number(req.body.minScore) : undefined,
+      useAi: req.body?.useAi !== false,
+      excludeKeywords: Array.isArray(req.body?.excludeKeywords) ? req.body.excludeKeywords.map(String) : undefined,
+    };
+    const ids: string[] = Array.isArray(req.body?.jobIds) ? req.body.jobIds.map((x: unknown) => String(x))
+      : req.body?.jobId ? [String(req.body.jobId)] : [];
+    if (!ids.length) return res.status(400).json({ error: '请提供 jobId 或 jobIds' });
+
+    const jobs = ids.map((id) => db.getJob(id)).filter(Boolean) as ReturnType<typeof db.getJob>[];
+    // 显式写出返回行类型。私有库里展开为 { job: JobRow; decision: GreetDecision }，
+    // 基础版里核心模块是桩（导出为 any）⇒ 退化为 any。
+    // 🔴 不写死 any：那会让私有库也丢掉真实类型检查（本地绿、真库瞎）。
+    const results: Array<Awaited<ReturnType<typeof decideGreetBatch>>[number]> =
+      await decideGreetBatch(jobs as any[], profile, opts);
+
+    if (req.body?.apply === true) {
+      for (const { job, decision } of results) {
+        db.updateJob(job!.id, { skip_reason: decision.greet ? null : decision.reason });
+      }
+    }
+    res.json({
+      total: results.length,
+      greet: results.filter((r) => r.decision.greet).length,
+      skip: results.filter((r) => !r.decision.greet).length,
+      applied: req.body?.apply === true,
+      results: results.map(({ job, decision }) => ({
+        jobId: job!.id, company: job!.company, position: job!.position,
+        greet: decision.greet, reason: decision.reason, source: decision.source,
+        score: decision.score ?? null, evidence: decision.evidence || [],
+      })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '打招呼决策失败' });
+  }
+});
+
+/** 生成/预览求职信（对标同类产品 type2「AI写求职信」）
+ *  入参：{ jobId, kind: 'hello'|'letter'|'reply', mode: 'ai'|'custom', chatHistory?, hrGroupId?, save? }
+ *  save=true 时写入 cover_letters 台账（后续三重去重会挡住重复发送）。 */
+app.post("/api/jobs/cover-letter", async (req, res) => {
+  try {
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    let job: any = req.body?.job;
+    if (!job && req.body?.jobId) {
+      const j = db.getJob(String(req.body.jobId));
+      if (!j) return res.status(404).json({ error: '岗位不存在' });
+      job = { id: j.id, company: j.company, position: j.position, jd: j.jd, requirements: j.requirements, city: j.city };
+    }
+    if (!job) return res.status(400).json({ error: '请提供 jobId 或 job 对象' });
+
+    const r = await composeCoverLetter({
+      platform: String(req.body?.platform || job.source || 'boss'),
+      kind: req.body?.kind || 'letter',
+      mode: req.body?.mode === 'custom' ? 'custom' : 'ai',
+      job,
+      jd: req.body?.jd || job.jd || null,
+      chatHistory: req.body?.chatHistory || null,
+      hrGroupId: req.body?.hrGroupId || null,
+      hrReplied: req.body?.hrReplied === true,
+      profile,
+      templateContent: req.body?.templateContent || null,
+    });
+
+    if (r.ok && req.body?.save === true && !r.skipped) {
+      markLetterSent({
+        platform: String(req.body?.platform || job.source || 'boss'),
+        job, hrGroupId: req.body?.hrGroupId || null,
+        content: r.content, source: r.source,
+      });
+    }
+    res.json(r);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '求职信生成失败' });
+  }
+});
+
+/** 自定义求职信模板（含可用变量清单）。GET 读取，POST 保存，DELETE 清空。 */
+app.get("/api/cover-letter/template", (_req, res) => {
+  res.json({ template: getLetterTemplate(), variables: TEMPLATE_VARIABLES });
+});
+app.post("/api/cover-letter/template", (req, res) => {
+  try {
+    const name = String(req.body?.name || '未命名模板');
+    const content = String(req.body?.content || '');
+    if (!content.trim()) return res.status(400).json({ error: '模板内容不能为空' });
+    res.json({ ok: true, template: saveLetterTemplate(name, content), variables: TEMPLATE_VARIABLES });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '模板保存失败' });
+  }
+});
+app.delete("/api/cover-letter/template", (_req, res) => {
+  clearLetterTemplate();
+  res.json({ ok: true });
+});
+
+/** 投递效果 A/B 测试报告（对标 LoopCV）：按 strategy 聚合回复率/面试率，给出胜出策略 */
+app.get("/api/apply/ab-report", (_req, res) => {
+  try {
+    const report = computeAbReport();
+    res.json(report);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'A/B 报告生成失败' });
+  }
+});
+
+/** 存量数据回填：给未打标的历史投递补 `legacy` 标签（仅运行一次；不改变 A/B 结论） */
+app.post("/api/apply/ab-backfill", (_req, res) => {
+  try {
+    const n = backfillLegacyStrategy();
+    res.json({ ok: true, backfilled: n });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '回填失败' });
+  }
+});
+
+/** 投递操作证据回溯清单：返回带 evidence_path 的投递（公司/职位/平台/证据路径/时间/策略），供前端「录屏回溯」面板展示 */
+app.get("/api/apply/evidence", (_req, res) => {
+  try {
+    const rows = db.listEvidenceApplications();
+    const items = rows.map((a: any) => ({
+      id: a.id,
+      platform: a.platform,
+      company: a.company,
+      position: a.position,
+      // 前端用 `<img src>` 渲染（发不出请求头），所以这里直接给**已签名**的路径。
+      // 让签名逻辑只存在于服务端，控制台不需要知道有这回事。
+      evidence_path: a.evidence_path ? signStaticPath(a.evidence_path) : a.evidence_path,
+      video_path: a.video_path ? signStaticPath(a.video_path) : null,
+      strategy: a.strategy || null,
+      status: a.status,
+      created_at: a.created_at,
+    }));
+    res.json({ ok: true, total: items.length, items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '证据清单读取失败' });
+  }
+});
+
+/** 近 N 天投递趋势（O3）：按日聚合 applications（键与 created_at 同为 UTC 日，避免跨时区错位） */
+app.get("/api/stats/trend", (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(30, Number(req.query.days) || 7));
+    const keys: string[] = [];
+    for (let i = days - 1; i >= 0; i--) keys.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+    // SQL 按日聚合，不把行捞到应用层再数。
+    // 🔴 原来是 `listApplications(5000)` + 循环计数：库里越过 5000 条之后，最近 N 天的
+    //    柱子会开始**莫名变矮** —— 丢的是最早创建的那批，往往正落在窗口内，
+    //    而 `total` 跟着一起变小。没有任何东西会变成红的。
+    // DAY 键与 created_at 同为 UTC 日：substr(...,1,10) 与 String(created_at).slice(0,10) 等价。
+    const bucketRows = db.query<{ d: string; c: number }>(
+      'SELECT substr(created_at, 1, 10) d, COUNT(*) c FROM applications '
+      + 'WHERE substr(created_at, 1, 10) >= ? GROUP BY d', [keys[0]]);
+    const buckets = new Map<string, number>(keys.map((k) => [k, 0]));
+    let counted = 0;
+    for (const r of bucketRows) {
+      if (buckets.has(r.d)) { buckets.set(r.d, (buckets.get(r.d) || 0) + r.c); counted += r.c; }
+    }
+    const items = [...buckets.entries()].map(([date, count]) => ({ date, count }));
+    res.json({ ok: true, days, total: counted, max: Math.max(1, ...items.map((i) => i.count)), items });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '趋势读取失败' });
+  }
+});
+
+/** 手动开始操作录屏（真·CDP screencast）。批量投递请用 batch 的 `record` 开关自动录/停 */
+app.post("/api/apply/record-video/start", async (req, res) => {
+  try {
+    const platform = String(req.body?.platform || '').trim();
+    if (!isSupported(platform)) {
+      return res.status(400).json({ error: `不支持的平台：${platform || '(空)'}（可录制：${SUPPORTED_PLATFORMS.join(' / ')}）` });
+    }
+    const r = await startRecording(platform, {
+      dir: `evidence/vid-${platform}-${Date.now()}`,
+      maxFrames: Number(req.body?.maxFrames) || 1500,
+      maxSeconds: Number(req.body?.maxSeconds) || 240,
+      quality: Number(req.body?.quality) || 55,
+    });
+    res.json(r);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '启动录屏失败' });
+  }
+});
+
+/** 停止操作录屏并归档（生成 play.html；本机有 ffmpeg 时另出 mp4） */
+app.post("/api/apply/record-video/stop", async (req, res) => {
+  try {
+    const platform = String(req.body?.platform || '').trim();
+    if (!platform) return res.status(400).json({ error: '缺少 platform' });
+    const r = await stopRecording(platform);
+    res.json(r);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '停止录屏失败' });
+  }
+});
+
+/** 过程抽帧录制（对标 CareerBoom.ai 录屏；本实现是**抽帧序列**而非视频，见 recordFrames 注释） */
+app.get("/api/apply/record", async (req, res) => {
+  try {
+    const platform = String(req.query.platform || '').trim();
+    if (!isSupported(platform)) {
+      return res.status(400).json({ error: `不支持的平台：${platform || '(空)'}（可录制：${SUPPORTED_PLATFORMS.join(' / ')}）` });
+    }
+    const r = await recordFrames(platform, {
+      seconds: Number(req.query.seconds) || 8,
+      intervalMs: Number(req.query.intervalMs) || 1200,
+    });
+    // 前端用 `<img src>` / `<a href>` 展示这些帧（发不出请求头）⇒ 路径要先签名
+    res.json({
+      ...r,
+      dir: r.dir ? signStaticPath(r.dir) : r.dir,
+      frames: (r.frames || []).map((f: string) => signStaticPath(f)),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '录制失败' });
+  }
+});
+
+/** 简历合规检测（对标 LoopCV「简历合规检测 / ATS 体检」）：纯本地、可离线、结果可复现 */
+app.post("/api/resume/compliance", (req, res) => {
+  try {
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    const report = checkResumeCompliance({
+      profile: req.body?.useProfile === false ? null : profile,
+      resumeText: req.body?.resumeText || null,
+      jd: req.body?.jd || null,
+    });
+    res.json(report);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '简历体检失败' });
+  }
+});
+
+/** 模板试渲染：把变量替换后返回，方便前端所见即所得地预览 */
+app.post("/api/cover-letter/render", (req, res) => {
+  const tpl = String(req.body?.content || '');
+  const vars = (req.body?.vars && typeof req.body.vars === 'object') ? req.body.vars : {};
+  res.json({ rendered: renderLetterTemplate(tpl, vars) });
+});
+
+/** 面试攻略（对标同类产品「面试鸭攻略」）。GET 读缓存，POST 生成（force 重算）。 */
+app.get("/api/jobs/interview-prep", (req, res) => {
+  const jobId = String(req.query.jobId || '');
+  if (!jobId) return res.status(400).json({ error: '请提供 jobId' });
+  const cached = getInterviewPrep(jobId);
+  if (!cached) return res.status(404).json({ error: '尚无该岗位的面试攻略，请先生成', cached: false });
+  res.json({ ...cached, cached: true });
+});
+app.post("/api/jobs/interview-prep", async (req, res) => {
+  try {
+    const jobId = String(req.body?.jobId || '');
+    if (!jobId) return res.status(400).json({ error: '请提供 jobId' });
+    const job = db.getJob(jobId);
+    if (!job) return res.status(404).json({ error: '岗位不存在' });
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    const r = await buildInterviewPrep(profile, job, { force: req.body?.force === true });
+    if (req.body?.clear === true) clearInterviewPrep(jobId);
+    res.json({ ...r, jobId, company: job.company, position: job.position, aiEnabled: isAiEnabled() });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '面试攻略生成失败' });
+  }
+});
+
+/** 简历版本（original / optimized / tailored）——对标同类产品 resumeType 开关 */
+app.get("/api/resume/version", (_req, res) => {
+  res.json(resumeVersionStatus());
+});
+app.post("/api/resume/version", (req, res) => {
+  const v = setResumeVersion(String(req.body?.version || 'original'));
+  res.json({ ok: true, version: v, label: RESUME_VERSION_LABELS[v], status: resumeVersionStatus() });
+});
+
+// ============= 简历上传（落盘 + 自动解析） =============
+const RES_DATA = path.dirname(TAILORED_DIR); // data/
+const RES_META_PATH = path.join(RES_DATA, 'resume_meta.json');
+function readResMeta() { try { return JSON.parse(fs.readFileSync(RES_META_PATH, 'utf-8')); } catch { return {}; } }
+function writeResMeta(m: any) { fs.writeFileSync(RES_META_PATH, JSON.stringify(m, null, 2)); }
+function resFileFor(version: string) {
+  return version === 'optimized' ? path.join(RES_DATA, 'resume_optimized.pdf') : path.join(RES_DATA, 'resume_source.pdf');
+}
+
+app.post("/api/resume/upload", async (req, res) => {
+  try {
+    const { fileName, data, version } = req.body || {};
+    const ver = version === 'optimized' ? 'optimized' : 'original';
+    if (!data || typeof data !== 'string') return res.status(400).json({ error: '未收到文件数据' });
+    let buf;
+    try { buf = Buffer.from(data, 'base64'); } catch { return res.status(400).json({ error: '文件数据解码失败' }); }
+    if (buf.length === 0) return res.status(400).json({ error: '文件为空' });
+    if (buf.length > 8 * 1024 * 1024) return res.status(400).json({ error: '文件过大（上限 8MB）' });
+    const isPdf = buf.slice(0, 4).toString('latin1') === '%PDF';
+    const isDocx = buf.slice(0, 2).toString('latin1') === 'PK';
+    if (!isPdf && !isDocx) return res.status(400).json({ error: '仅支持 PDF / Word(.docx) 简历' });
+    const target = resFileFor(ver);
+    if (fs.existsSync(target)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      try { fs.renameSync(target, target + '.bak.' + ts); } catch {}
+    }
+    fs.writeFileSync(target, buf);
+    const profile = db.getProfile();
+    profile[ver === 'optimized' ? 'optimized_resume_path' : 'resume_path'] = target;
+    db.saveProfile(profile);
+    const meta = readResMeta();
+    meta[ver] = { fileName: fileName || path.basename(target), size: buf.length, uploadedAt: new Date().toISOString() };
+    writeResMeta(meta);
+    let parsed = undefined, warning = undefined;
+    // ⚠️ 2026-09-25 修复：此前只对 PDF 解析，.docx 即便能保存也**不参与匹配/定制**。
+    //    而解析管线（resume.ts 的 extractResumeText）本就支持 PDF/DOCX/TXT（DOCX 走 mammoth）——
+    //    限制纯粹来自这里，去掉即可让 Word 简历同样进入匹配与定制。
+    try {
+      const struct = await parseResumeFile(target);
+      if (Array.isArray(struct.skills) && struct.skills.length) {
+        const cur: any = db.getProfile();
+        const prev: any = (cur.skills as any) || '';
+        const merged = Array.from(new Set([
+          ...prev.split(/[,，、]/).map((x: string) => String(x).trim()).filter(Boolean),
+          ...struct.skills,
+        ])).filter(Boolean).join('，');
+        db.saveProfile(Object.assign({}, cur, { skills: merged }));
+      }
+      parsed = { name: struct.name, phone: struct.phone, email: struct.email, skills: (struct.skills || []).length, projects: (struct.projects || []).length, rawTextLength: (struct.rawText || '').length };
+      if (struct.rawText.trim().length < 30) {
+        warning = '简历已保存，但抽取到的文本极少（可能是扫描件/图片版）——匹配与定制效果会受限，建议上传文字版 PDF 或 DOCX。';
+      }
+    } catch (e: any) { warning = '简历已保存，但自动解析失败：' + (e && e.message ? e.message : e); }
+    res.json({ ok: true, version: ver, path: target, meta: meta[ver], parsed, warning });
+  } catch (error: any) {
+    res.status(500).json({ error: (error && error.message) ? error.message : '简历上传失败' });
+  }
+});
+
+app.get("/api/resume/current", (_req, res) => {
+  const meta = readResMeta();
+  const build = (ver: string) => {
+    const target = resFileFor(ver);
+    const m = meta[ver];
+    // url      = 裸路径，小程序用它 + `X-Auth-Token` 头（downloadFile 支持自定义头）；
+    // previewUrl = 带短时签名，专供控制台 `window.open`（新标签页发不出请求头）。
+    return {
+      exists: fs.existsSync(target),
+      size: fs.existsSync(target) ? fs.statSync(target).size : 0,
+      fileName: m && m.fileName,
+      uploadedAt: m && m.uploadedAt,
+      url: '/api/resume/file?version=' + ver,
+      previewUrl: signStaticPath('/api/resume/file?version=' + ver),
+    };
+  };
+  res.json({ status: resumeVersionStatus(), original: build('original'), optimized: build('optimized') });
+});
+
+app.get("/api/resume/file", (req, res) => {
+  const ver = String(req.query.version) === 'optimized' ? 'optimized' : 'original';
+  const target = resFileFor(ver);
+  if (!fs.existsSync(target)) return res.status(404).json({ error: '简历文件不存在' });
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', 'inline; filename="' + path.basename(target) + '"');
+  fs.createReadStream(target).pipe(res);
+});
+
+/** 运行时间段调度（对标同类产品 TimeManager）。GET 全平台，POST 设置单平台。 */
+app.get("/api/schedule", (_req, res) => {
+  res.json({
+    schedules: listSchedules().map((s) => ({ ...s, description: describeSchedule(s.platform), status: evaluateSchedule(s.platform) })),
+  });
+});
+app.post("/api/schedule", (req, res) => {
+  try {
+    const platform = String(req.body?.platform || '');
+    if (!platform) return res.status(400).json({ error: '请提供 platform' });
+    const saved = setSchedule(platform, {
+      enabled: req.body?.enabled,
+      slots: Array.isArray(req.body?.slots) ? req.body.slots : undefined,
+      reset: req.body?.reset === true,
+    });
+    res.json({ ok: true, schedule: saved, description: describeSchedule(platform), status: evaluateSchedule(platform) });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '时间段保存失败' });
+  }
+});
+app.post("/api/schedule/advance", (req, res) => {
+  const platform = String(req.body?.platform || '');
+  if (!platform) return res.status(400).json({ error: '请提供 platform' });
+  res.json({ ok: true, schedule: advanceSchedule(platform) });
+});
+
+/** 猎聘「交换联系方式」配置与执行（发简历 / 换手机号 / 换微信号） */
+app.get("/api/exchange/actions", (_req, res) => {
+  res.json({ actions: getExchangeActions(), labels: EXCHANGE_LABELS, options: Object.entries(EXCHANGE_LABELS).map(([value, label]) => ({ value, label })) });
+});
+app.post("/api/exchange/actions", (req, res) => {
+  res.json({ ok: true, actions: setExchangeActions(req.body?.actions) });
+});
+app.post("/api/exchange/run", async (req, res) => {
+  try {
+    const actions = Array.isArray(req.body?.actions) ? req.body.actions : getExchangeActions();
+    const logs = new (await import("./services/apply/common.js")).ApplyLogger();
+    const results = await runExchangeActions('liepin', actions, logs);
+    res.json({ ok: results.every((r) => r.outcome !== 'failed'), summary: summarizeExchange(results), results, logs: logs.logs });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '交换动作执行失败' });
+  }
+});
+
+/** 简历「聊天图」通道：生成 PNG（可顺带发到当前聊天框）。
+ *  入参 { jobId, send?: boolean }；返回 PNG 路径，可静态访问 /data/resume_tailored/<file>.png */
+app.post("/api/jobs/chat-resume", async (req, res) => {
+  try {
+    const jobId = String(req.body?.jobId || '');
+    if (!jobId) return res.status(400).json({ error: '请提供 jobId' });
+    const job = db.getJob(jobId);
+    if (!job) return res.status(404).json({ error: '岗位不存在' });
+    const profile = (db.getProfile() as Record<string, any>) || {};
+    const png = await ensureChatResumePng(
+      { id: job.id, company: job.company, position: job.position, jd: job.jd, requirements: job.requirements },
+      { profile, force: req.body?.force === true },
+    );
+    if (!png.ok) return res.status(500).json(png);
+    let sent: { ok: boolean; detail: string } | null = null;
+    if (req.body?.send === true) {
+      sent = await sendChatResumeImage(job.source, png.pngPath!);
+    }
+    res.json({
+      ...png, sent,
+      url: `/data/resume_tailored/${path.basename(png.pngPath!)}`,
+      note: 'PNG 聊天图用于「平台内聊天」场景；若该岗位有 HR 邮箱，建议改用 PDF 邮件通道（可被 ATS 解析）',
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '聊天简历图生成失败' });
+  }
+});
+
+/** 简历通道决策：给定岗位（是否已有 HR 邮箱），返回该走哪条通道以及理由 */
+app.post("/api/resume/channel", (req, res) => {
+  const platform = String(req.body?.platform || '');
+  const hasEmail = req.body?.hasEmail === true;
+  res.json({ ...decideResumeChannel({ hasEmail, platform }), chatImagePlatforms: Object.keys(CHAT_IMAGE_INPUTS) });
+});
+
+/** 岗位定位 / 公司背调（对标同类产品 bossSearch.js，即前端所谓「AI公司背调」）
+ *  入参 { jobId, platform? } —— BOSS 走「公司 → 在招职位 → 职位」两级定位，其他平台直达详情页。 */
+app.post("/api/jobs/locate", async (req, res) => {
+  try {
+    const jobId = String(req.body?.jobId || '');
+    if (!jobId) return res.status(400).json({ error: '请提供 jobId' });
+    const r = await locateJobById(jobId, req.body?.platform ? String(req.body.platform) : undefined);
+    res.json(r);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '岗位定位失败' });
+  }
+});
+
+/** 排除词表（打招呼决策的默认排除项，前端只读展示） */
+app.get("/api/jobs/exclude-keywords", (_req, res) => {
+  res.json({ keywords: DEFAULT_EXCLUDE_KEYWORDS });
+});
+
+/**
+ * GET /api/jobs/:id —— 单个岗位的**全字段**（含 `jd` 正文）。
+ *
+ * 🔴 为什么要单开一个端点：`GET /api/jobs` 现在只回轻量列（`jd` 一项就占响应体
+ *    60.9%），而「详情」恰恰要看正文。在此之前 `showJob()` 的做法是**再打一遍
+ *    `GET /api/jobs`，然后从里面 find 一条** —— 每点一次「详情」就把整个岗位池
+ *    搬过网一次，而且列表越全代价越大（这正是本次要修的缺陷的放大器）。
+ *
+ * ⚠️ **注册位置有硬约束**：必须在所有静态子路径（`/api/jobs/image-jd`、
+ *    `/api/jobs/remote-stat`、`/api/jobs/ocr-status`、`/api/jobs/interview-prep`、
+ *    `/api/jobs/exclude-keywords` 等）**之后**。Express 按注册顺序匹配，`:id` 是个
+ *    通配段 —— 放前面会把上面那几个接口整个吞掉（返回「岗位不存在」404，而没有任何
+ *    地方会报错）。合约测试里有一条断言机械地钉住这个顺序。
+ */
+app.get("/api/jobs/:id", (req, res) => {
+  try {
+    const job = db.getJob(String(req.params.id));
+    if (!job) return res.status(404).json({ error: "岗位不存在" });
+    res.json({ job });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "获取岗位详情失败" });
+  }
+});
+
+/** 对指定岗位批量「邮箱直投」（channel=email + realSend，SSE 进度） */
+app.post("/api/offerbiu/email-apply", async (req, res) => {
+  const jobIds: string[] = Array.isArray(req.body?.jobIds) ? req.body.jobIds.map((x: unknown) => String(x)) : [];
+  /** 一岗一简历开关：true 时先按各岗位 JD 生成定制 PDF，作为本次投递的附件 */
+  const tailor = req.body?.tailor === true;
+  /** 预取证邮箱映射（jobId -> 已核验 HR 邮箱）：提供后邮箱通道跳过页面重抽，规避微信限流 */
+  const emails: Record<string, string> = req.body?.emails && typeof req.body.emails === 'object' ? req.body.emails : {};
+  const intervalMs = Math.max(0, Number(req.body?.intervalMs ?? 8000));
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const send = (e: unknown) => { res.write(`data: ${JSON.stringify(e)}\n\n`); };
+  const profile = db.getProfile() as Record<string, unknown> | undefined;
+  // 🔴 五个桶各自对应一个语义，别再压成一个 fail：
+  //    ok=已投递 / previewed=预览未发信 / skipped=主动跳过（隔离、闸门拦下）
+  //    / manual=需人工 / fail=真失败
+  let ok = 0, fail = 0, previewed = 0, skipped = 0, manual = 0;
+  try {
+    if (!jobIds.length) {
+      send({ type: 'error', message: '未选择任何岗位' });
+      return;
+    }
+    if (!profile?.email) {
+      send({ type: 'error', message: '档案未配置邮箱，无法发信。请先在「我的档案」填写邮箱与授权码' });
+      return;
+    }
+
+    // 一岗一简历：投递前先按各岗位 JD 生成定制 PDF（串行，带内容哈希缓存，重复投递不会重算）
+    const resumeOverrides: Record<string, string> = {};
+    if (tailor) {
+      send({ type: 'progress', index: 0, total: jobIds.length, message: '一岗一简历：正在按 JD 生成定制简历…' });
+      let tailored = 0;
+      for (const jid of jobIds) {
+        const j = db.getJob(jid);
+        if (!j) continue;
+        const r = await ensureTailoredResumePdf(
+          { id: j.id, company: j.company, position: j.position, jd: j.jd, requirements: j.requirements },
+          { profile },
+        ).catch((e: any) => ({ ok: false, error: e?.message } as any));
+        if (r.ok && r.pdfPath) {
+          resumeOverrides[j.id] = r.pdfPath;
+          tailored++;
+          send({ type: 'progress', index: tailored, total: jobIds.length, jobId: j.id, company: j.company, position: j.position, message: `定制简历已生成（匹配度 ${r.matchScore ?? '-'}，${r.cached ? '缓存命中' : '新生成'}）` });
+        } else {
+          send({ type: 'progress', index: tailored, total: jobIds.length, jobId: j.id, message: `定制简历生成失败，将回退固定简历：${r.error || '未知错误'}` });
+        }
+      }
+      send({ type: 'progress', index: jobIds.length, total: jobIds.length, message: `一岗一简历就绪：${tailored}/${jobIds.length} 份定制简历` });
+    }
+
+    for (let i = 0; i < jobIds.length; i++) {
+      const job = db.getJob(jobIds[i]);
+      if (!job) { fail++; send({ type: 'result', jobId: jobIds[i], status: 'error', message: '岗位不存在' }); continue; }
+      // 跨公司串号隔离：扫描阶段已标记的 quarantine 默认跳过，避免简历发错公司（force 可强制）
+      if (job.quarantine && !req.body?.force) {
+        skipped++; send({ type: 'result', jobId: job.id, status: 'skipped', message: `已隔离（${job.quarantine}）；如需投递请勾选强制` });
+        continue;
+      }
+      send({ type: 'progress', index: i, total: jobIds.length, jobId: job.id, company: job.company, position: job.position });
+      try {
+        // 🔴 `platform: 'offerbiu'` 在这里不是「来源标签」，而是**路由键**：它落到
+        //    `runOfferbiuEmail`（邮箱直投通道）。所以**不要**改成按 `job.source` 分发 ——
+        //    job.source='job51' 会派到 `runJob51` 的表单引擎，把「发邮件」变成「去平台点表单」。
+        //    扫描侧已经把范围放开到「非平台自有域的全部岗位」（含微信推文 / 企业官网表单），
+        //    但投递侧永远只走这一条邮箱通道。
+        const r = await runApply({
+          platform: 'offerbiu',
+          jobUrl: job.apply_url || undefined,
+          job: { id: job.id, company: job.company, position: job.position, apply_url: job.apply_url },
+          profile: toApplyProfile(profile),
+          autofill: (profile.autofill as Record<string, string>) || undefined,
+          channel: 'email',
+          realSend: true,
+          // 安全不变量：即便是"邮箱直投"这条会真实发信的路径，也要尊重「仅预览」——
+          // 传了 preview:true 就只解析收件人/正文，不真正发信（dryRun 会拦下发送）。
+          preview: req.body?.preview === true,
+          dryRun: req.body?.preview === true,
+          email: emails[job.id] || undefined,
+          /**
+           * 🔴 库内 JD 正文：走「预取证邮箱」时会跳过页面加载 ⇒ 没有它，
+           * 「招聘方要求的邮件标题」就永远解析不到（见 runOfferbiuEmail 的 1.5 步）。
+           */
+          jdText: job.jd || undefined,
+          /** 强制：越过「隔离」与「收件箱不可投递」两道闸门（见 runOfferbiuEmail 的 4.5 步） */
+          force: req.body?.force === true,
+          /** 一岗一简历：该岗位的定制 PDF（未生成成功则不传 → 回退固定简历） */
+          resumeOverride: resumeOverrides[job.id],
+        });
+        if (r.status === 'applied') {
+          ok++;
+          try {
+            db.createApplication({
+              id: uuidv4(),
+              platform: 'offerbiu',
+              company: r.company || job.company || '',
+              position: r.position || job.position || '',
+              salary: job.salary || '',
+              city: job.city || '',
+              job_url: job.apply_url || '',
+              status: 'applied',
+              login_method: 'email',
+              message: '邮箱直投（Offerbiu 招聘邮箱）',
+            });
+            db.updateJob(job.id, { status: 'applied' });
+          } catch { /* 记录失败不阻断 */ }
+        } else if (r.status === 'preview') {
+          // dry-run 预览：没发信，但也**不是失败** —— 单列一桶，别混进 fail
+          previewed++;
+        } else if (r.status === 'skipped') {
+          // 主动跳过：闸门拦下「不发」/ 其他明确不投
+          skipped++;
+        } else if (r.status === 'need_manual') {
+          // 需人工：推文正文加载不出、找不到 HR 邮箱、官网入口识别不到…
+          manual++;
+        } else {
+          fail++;
+        }
+        send({ type: 'result', jobId: job.id, status: r.status, company: r.company || job.company, message: r.message });
+      } catch (e: any) {
+        fail++;
+        send({ type: 'result', jobId: job.id, status: 'error', company: job.company, message: e?.message || String(e) });
+      }
+      if (i < jobIds.length - 1 && intervalMs > 0) await new Promise((rr) => setTimeout(rr, intervalMs));
+    }
+    send({ type: 'done', ok, fail, previewed, skipped, manual, total: jobIds.length });
+    res.write('event: end\ndata: {}\n\n');
+  } catch (error: any) {
+    send({ type: 'error', message: error?.message || '邮箱直投失败' });
+  } finally {
+    res.end();
+  }
+});
+
+// ============= 城市选择与定位 =============
+
+/**
+ * 城市列表（供控制台「目标城市」搜索选择器）。
+ * 不带 q 时返回**全国全部城市**（373 个 / 34 个省级行政区），控制台一次拉全、本地即时过滤。
+ * ?q=关键 服务端过滤（口径同 listCities：城市名/省份/全拼/首字母/BOSS 码）；
+ * ?platform=boss 会带上该城市在该平台是否可用（无码的平台返回 supported=false）。
+ */
+app.get("/api/cities", (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const platform = String(req.query.platform || "").trim();
+    const cities = listCities(q).map((c) => ({
+      name: c.name,
+      province: c.province,
+      boss: c.boss,
+      pinyin: c.pinyin || null,
+      abbr: c.abbr || null,
+      supported: platform ? isCitySupported(platform, c.name) : true,
+    }));
+    res.json({ total: cityCount(), matched: cities.length, default: DEFAULT_CITY, cities });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "读取城市列表失败" });
+  }
+});
+
+/**
+ * 通过出口 IP 定位当前城市（控制台「📍定位」按钮）。
+ * 只返回**建议值**，不直接改档案 —— 由前端确认后写入，避免静默覆盖用户设置。
+ */
+app.get("/api/geo/locate", async (_req, res) => {
+  try {
+    const loc = await locateByIp();
+    const city = loc.city ? findCity(loc.city) : null;
+    res.json({
+      ...loc,
+      /** 是否命中内置城市表（命中才能拿到各平台城市码） */
+      inCityTable: Boolean(city),
+      matchedName: city?.name || null,
+      matchedProvince: city?.province || null,
+      bossCode: city?.boss || null,
+      supportedPlatforms: city ? DELIVERY_PLATFORMS.filter((p) => isCitySupported(p, city.name)) : [],
+      note: loc.city
+        ? (city ? `定位到「${city.name}」（${city.province}）` : `定位到「${loc.city}」，但不在内置城市表中，可手动填写`)
+        : "定位失败（可能是网络受限）：请手动选择城市",
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "定位失败" });
+  }
+});
+
+// ============= 跨平台批量连投（自动筛选 + 投递） =============
+
+/**
+ * 今日投递配额使用情况（只读）。
+ * 平台对骚扰式批量投递有账号级处罚，所以把"今天还能投几份"显式暴露出来，
+ * 而不是让用户投到被封号才发现。
+ */
+app.get("/api/apply/quota", (req, res) => {
+  try {
+    const platform = String(req.query.platform || "").trim();
+    // 🔴 2026-10-05 修「横幅与真闸门脱节」：原先固定用默认上限 40、**不读请求里的 dailyLimit**，
+    //   而 runBatchApply 的配额闸门读的是 criteria.dailyLimit ⇒ 用户把上限从 40 改成 41 后，
+    //   横幅仍显示「今日已投 40/40，还可投 0 份」，「显示能投几份」与「实际能不能投」永远对不上。
+    //   现在与真闸门同一份解析：query.dailyLimit → 环境变量 APPLY_DAILY_LIMIT → 默认 40。
+    const rawLimit = String((req.query as any)?.dailyLimit ?? "").trim();
+    const limit = resolveDailyLimit(rawLimit === "" ? undefined : Number(rawLimit));
+    const used = todayAppliedCount(platform || undefined);
+    // 平台级风控封锁（上一批命中额度到顶/账号异常后写入）：封锁期内批量投递会直接短路
+    const block = platform ? readPlatformRiskBlock(platform) : null;
+    res.json({
+      platform: platform || null,
+      used,
+      limit,
+      remaining: limit > 0 ? Math.max(0, limit - used) : null,
+      unlimited: limit <= 0,
+      blocked: Boolean(block),
+      blockedUntil: block ? new Date(block.until).toISOString() : null,
+      blockedMinutesLeft: block ? Math.max(1, Math.ceil((block.until - Date.now()) / 60_000)) : null,
+      blockedReason: block?.reason || null,
+      note: limit > 0
+        ? `今日已投 ${used}/${limit}（${platform || "全部平台"}）；上限可用 APPLY_DAILY_LIMIT 环境变量或请求里的 dailyLimit 调整，0=不限制`
+        : "未设每日上限（不推荐）",
+    });
+  } catch (error: any) {
+    if (coreRequiredReplied(error, res)) return;
+    res.status(500).json({ error: error?.message || "查询配额失败" });
+  }
+});
+
+/** 手动解除平台风控封锁（运维用；用户确认已在浏览器里人工处理好风控后调用） */
+app.post("/api/apply/risk-unblock", (req, res) => {
+  try {
+    const platform = String(req.body?.platform || "").trim();
+    if (!platform) return res.status(400).json({ error: "请提供 platform" });
+    clearPlatformRiskBlock(platform);
+    res.json({ ok: true, platform, message: `已解除「${platform}」的风控封锁（请确认已人工处理完平台验证，否则很快会再次触发）` });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "解除封锁失败" });
+  }
+});
+
+app.post("/api/apply/batch", async (req, res) => {
+  try {
+    const {
+      platform, source, criteria, collect, limit, headless, sinceMinutes, intervalMs, stream, realSend, preview, liveCollect,
+    } = req.body || {};
+
+    if (platform && platform !== 'auto' && !isSupported(platform)) {
+      return res.status(400).json({ error: `不支持的平台：${platform}（支持：boss / zhilian / job51 / nowcoder / liepin / iguopin / yupao / offerbiu / wangshen，或 auto 自动路由；auto 会把网申型链接自动分到 wangshen）` });
+    }
+
+    // 修复：引擎是按 source 过滤岗位库的（db.listJobs({source})），不是按 platform。
+    // 只传 platform 时会拿其它平台的岗位去投（例如选 nowcoder 却投了 boss 的岗位），
+    // 因此 source 未显式指定时，让它跟随 platform。
+    const effectiveSource = source ?? (platform && platform !== 'auto' ? platform : undefined);
+
+    const input = {
+      platform,
+      source: effectiveSource,
+      criteria,
+      collect: (collect === 'offerbiu' ? 'offerbiu' : false) as false | 'offerbiu',
+      realSend: realSend === true,
+      // 投前实时采集：先上 BOSS 实搜真实岗位再投（2026-10-05）
+      liveCollect: liveCollect === true,
+      // 平台通道只读预览（dry-run）：零真实投递地验证链路
+      preview: preview === true,
+      limit: limit ? Number(limit) : 10,
+      headless: headless === true,
+      sinceMinutes: sinceMinutes ? Number(sinceMinutes) : 10,
+      intervalMs: intervalMs != null ? Number(intervalMs) : 20000,
+    };
+
+    // 流式模式：用 SSE 实时推送进度与「需要输入」事件，便于前端弹窗提示
+    if (stream === true) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      const send = (e: unknown) => { res.write(`data: ${JSON.stringify(e)}\n\n`); };
+      req.on('close', () => { /* 客户端断开：事件循环会继续跑完，只停止推送 */ });
+      try {
+        await runBatchApply(input, (e: BatchEvent) => send(e));
+        res.write('event: end\ndata: {}\n\n');
+      } catch (error: any) {
+        // SSE 已经发出去了（首个 res.write 已提交响应头），回不了 501 状态码 ⇒ 翻译成友好文案
+        send({ type: 'error', message: isCoreUnavailable(error) ? CORE_REQUIRED_MESSAGE : (error?.message || '批量投递失败') });
+      } finally {
+        res.end();
+      }
+      return;
+    }
+
+    const result = await runBatchApply(input);
+    res.json(result);
+  } catch (error: any) {
+    if (coreRequiredReplied(error, res)) return;
+    console.error('[batch] 未捕获异常:', error?.stack || error);
+    res.status(500).json({ error: error?.message || '批量投递失败' });
+  }
+});
+
+// ============= 跨平台专用投递（BOSS / 智联） =============
+
+// ============= BOSS HR 消息自动回复（SSE 流式，控制台可视化） =============
+
+let autoReplyController: AbortController | null = null;
+
+/**
+ * 自动回复支持的平台清单 —— 控制台下拉的数据源。
+ *
+ * 单一真相源 = `autoReplyRunner.DRIVERS`（平台能力写在驱动自己身上）。
+ * 🔴 控制台**不得**再硬编码平台选项：历史上前后端各写一份，前端只列 2 个、
+ *    后端也只放行 2 个，导致已真机校准的 zhilian 被挡在门外，用户以为
+ *    「自动回复只有 BOSS 和猎聘」。
+ */
+app.get("/api/auto-reply/platforms", (_req, res) => {
+  const all: AutoReplyPlatformInfo[] = listAutoReplyPlatforms();
+  res.json({
+    platforms: all.filter((p) => p.supported),
+    unsupported: all.filter((p) => !p.supported),
+  });
+});
+
+app.get("/api/auto-reply/run", async (req, res) => {
+  const q = req.query || {};
+  const unreadOnly = q.unreadOnly !== '0' && q.unreadOnly !== 'false';
+  const limit = Number(q.limit || 0) || 0;
+  const realSend = q.realSend === '1' || q.realSend === 'true';
+  // 🔴 非法平台必须**明确报错**，绝不静默降级：原先写成
+  //      ['boss','liepin'].includes(x) ? x : 'boss'
+  //    ⇒ 传 zhilian 会被悄悄当成 boss 跑（用户以为在回复智联，实际在 BOSS 上操作）。
+  //    这类「有真实副作用的静默降级」是最难发现的一类错误。
+  const requested = typeof q.platform === 'string' && q.platform.trim() ? q.platform.trim() : 'boss';
+  const allPlats: AutoReplyPlatformInfo[] = listAutoReplyPlatforms();
+  if (!isAutoReplyPlatform(requested)) {
+    return res.status(400).json({
+      error: `平台「${requested}」不支持自动回复`,
+      supported: allPlats.filter((p) => p.supported).map((p) => p.id),
+    });
+  }
+  const platform = requested;
+  // useAi：是否用大模型生成话术。默认 true（API 已配置时自动启用，未配置自动回退规则）。
+  // 传 useAi=0/false 可强制走规则模板。
+  const useAi = q.useAi !== '0' && q.useAi !== 'false';
+  // name：只处理指定 HR 名，支持逗号分隔或多个同名参数（与 CLI --name 对齐）。
+  const names: string[] = [];
+  const rawName = q.name;
+  if (typeof rawName === 'string' && rawName.trim()) {
+    names.push(...rawName.split(',').map((s) => s.trim()).filter(Boolean));
+  } else if (Array.isArray(rawName)) {
+    names.push(...rawName.map((s) => String(s).trim()).filter(Boolean));
+  }
+
+  if (autoReplyController) {
+    return res.status(409).json({ error: '自动回复正在运行，请先停止' });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+
+  autoReplyController = new AbortController();
+  const signal = autoReplyController.signal;
+
+  // signAi：是否在回复中署名 AI 身份（如「【懒懒】」）。默认由 profile.signAi 决定（缺省 true）；
+  // 仅在显式传 signAi=0/false 时强制不署名（CLI / 调试用）。
+  const opts: Record<string, unknown> = { unreadOnly, limit, realSend, signal, useAi, names };
+  if (q.signAi === '0' || q.signAi === 'false') opts.signAi = false;
+  const send = (ev: Record<string, unknown>) => {
+    res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  };
+
+  try {
+    await runAutoReply(platform as any, opts as any, send);
+  } catch (e: unknown) {
+    send({ type: 'error', message: String((e as Error)?.message || e) });
+  } finally {
+    autoReplyController = null;
+    send({ type: 'end' });
+    res.end();
+  }
+});
+
+app.post("/api/auto-reply/stop", (_req, res) => {
+  if (autoReplyController) {
+    autoReplyController.abort();
+    autoReplyController = null;
+  }
+  res.json({ ok: true });
+});
+
+// ============= 自动回复常驻监视器（按时效自动跟进 HR 消息） =============
+app.post("/api/auto-reply/watch/start", (_req, res) => {
+  startWatcher();
+  res.json({ ok: true, status: watcherStatus() });
+});
+app.post("/api/auto-reply/watch/stop", (_req, res) => {
+  stopWatcher();
+  res.json({ ok: true, status: watcherStatus() });
+});
+app.post("/api/auto-reply/watch/config", (req, res) => {
+  const body = req.body || {};
+  const patch: Record<string, unknown> = {};
+  for (const k of ['enabled', 'platforms', 'intervalSec', 'realSend', 'useAi', 'throttleSec', 'maxPerRun', 'hrCooldownSec'] as const) {
+    if (body[k] !== undefined) patch[k] = body[k];
+  }
+  setWatchConfig(patch as any);
+  res.json({ ok: true, status: watcherStatus() });
+});
+app.get("/api/auto-reply/watch/status", (_req, res) => {
+  res.json(watcherStatus());
+});
+// 监视器实时日志（SSE）：订阅 watchEmitter 的 tick 事件推给控制台
+app.get("/api/auto-reply/watch", (_req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  const send = (ev: Record<string, unknown>) => res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  send({ type: 'status', ...watcherStatus() });
+  const onTick = (payload: unknown) => send({ type: 'tick', ...(payload as Record<string, unknown>) });
+  watchEmitter.on('tick', onTick);
+  const keep = setInterval(() => res.write(': ping\n\n'), 15000);
+  const close = () => {
+    clearInterval(keep);
+    watchEmitter.off('tick', onTick);
+    res.end();
+  };
+  _req.on('close', close);
+});
+
+// ============= 批量投递常驻监视器（后台自动连投，受会话锁约束不与自动回复互抢） =============
+app.post("/api/auto-apply/watch/start", (_req, res) => {
+  startApplyWatch();
+  res.json({ ok: true, status: applyWatchStatus() });
+});
+app.post("/api/auto-apply/watch/stop", (_req, res) => {
+  stopApplyWatch();
+  res.json({ ok: true, status: applyWatchStatus() });
+});
+app.post("/api/auto-apply/watch/config", (req, res) => {
+  const body = req.body || {};
+  const patch: Record<string, unknown> = {};
+  for (const k of ['enabled', 'platforms', 'keyword', 'limit', 'intervalSec', 'intervalMs', 'minScore'] as const) {
+    if (body[k] !== undefined) patch[k] = body[k];
+  }
+  setApplyWatchConfig(patch as any);
+  res.json({ ok: true, status: applyWatchStatus() });
+});
+app.get("/api/auto-apply/watch/status", (_req, res) => {
+  res.json(applyWatchStatus());
+});
+app.get("/api/auto-apply/watch", (_req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  const send = (ev: Record<string, unknown>) => res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  send({ type: 'status', ...applyWatchStatus() });
+  const onTick = (payload: unknown) => send({ type: 'tick', ...(payload as Record<string, unknown>) });
+  applyWatchEmitter.on('tick', onTick);
+  const keep = setInterval(() => res.write(': ping\n\n'), 15000);
+  const close = () => {
+    clearInterval(keep);
+    applyWatchEmitter.off('tick', onTick);
+    res.end();
+  };
+  _req.on('close', close);
+});
+
+app.post("/api/apply", async (req, res) => {
+  try {
+    const { platform, jobId, jobUrl, headless, sinceMinutes, action, keyword, maxPages, maxApply, hrGroupId, chatHistory, jdText, channel, preview } = req.body || {};
+    if (!isSupported(platform)) {
+      return res.status(400).json({ error: `不支持的平台：${platform}（可直接投递：${SUPPORTED_PLATFORMS.join(' / ')}）` });
+    }
+    const profile = db.getProfile() as Record<string, unknown> | undefined;
+    if (!profile?.email) {
+      return res.status(400).json({ error: '档案未配置邮箱，无法读取登录验证码。请先在「我的档案」填写邮箱与授权码' });
+    }
+    let job: any = null;
+    if (jobId) job = db.getJob(jobId);
+    const targetUrl = jobUrl || job?.apply_url || undefined;
+
+    const result = await runApply({
+      platform,
+      jobUrl: targetUrl,
+      job: job ? { id: job.id, company: job.company, position: job.position, apply_url: job.apply_url } : undefined,
+      // 带上学历/学校/专业/城市/技能：官网邮箱投递常要求按「学历+专业+学校+姓名」拼标题
+      profile: toApplyProfile(profile),
+      autofill: (profile.autofill as Record<string, string>) || undefined,
+      headless: headless === true, // 默认非无头(false)，便于人工过滑块；传 true 才无头
+      sinceMinutes: sinceMinutes ? Number(sinceMinutes) : 10,
+      action: action || 'hello',
+      keyword: keyword ? String(keyword) : undefined,
+      maxPages: maxPages ? Number(maxPages) : undefined,
+      maxApply: maxApply ? Number(maxApply) : undefined,
+      hrGroupId: hrGroupId ? String(hrGroupId) : undefined,
+      chatHistory: chatHistory ? String(chatHistory) : undefined,
+      jdText: jdText ? String(jdText) : undefined,
+      channel: channel === 'email' ? 'email' : 'auto',
+      // ⚠️ 2026-09-21 修复：此前单岗接口**没有透传 preview** —— 传了 preview:true 也会走真实点击路径。
+      //    实测踩到：本想做"零副作用预览"，结果真的点了国聘的「申请职位」按钮。
+      //    预览是安全不变量，任何调用 runApply 的入口都必须透传。
+      preview: preview === true,
+      // preview 同时也是 offerbiu 官网/邮箱通道的 dry-run 信号（保持"仅预览"语义一致）
+      dryRun: req.body?.dryRun === true || preview === true,
+      realSend: req.body?.realSend === true,
+    });
+
+    // 投递成功 -> 写投递记录 + 更新岗位状态
+    if (result.status === 'applied' && (jobId || job)) {
+      const PLATFORM_LABEL: Record<string, string> = {
+        boss: 'BOSS直聘', zhilian: '智联招聘', job51: '前程无忧', liepin: '猎聘', nowcoder: '牛客网', offerbiu: '企业官网(Offerbiu)',
+        wangshen: '网申(企业官网)',
+      };
+      try {
+        const appId = uuidv4();
+        db.createApplication({
+          id: appId,
+          platform,
+          company: result.company || job?.company || '',
+          position: result.position || job?.position || '',
+          salary: job?.salary || '',
+          city: job?.city || '',
+          job_url: targetUrl || '',
+          status: 'applied',
+          // 网申走企业官网表单提交（非邮箱），其余仍按原口径记为邮箱投递
+          login_method: platform === 'wangshen' ? 'website' : 'email',
+          message: `由专用投递脚本完成（${PLATFORM_LABEL[platform] || platform}）；匹配分 ${job?.match_score ?? '—'}`,
+        });
+        // 2026-09-29 补：单岗投递此前**不落证据截图**，而批量投递（batch.ts）会落
+        // ⇒ 控制台「录屏回溯」面板只能看到批量通道的记录。实测：全库 applications 里
+        //   带 evidence_path 的只有 5 条，且全部停在 2026-09-24（那天跑的是批量）。
+        //   这里与 batch.ts 对齐：投递后对平台页截图，归档到 data/evidence/<appId>.png。
+        //   截图是可选审计证据，失败只 warn，**绝不阻断「已投递」主流程**。
+        // 刻意**不写 strategy**：A/B 报告按 strategy 分组，而单岗通道没有
+        //   「是否带求职信 / 用了哪版简历」这层语义，硬编一个值会给报告制造假分组。
+        try {
+          const shot = await tryScreenshot(platform, appId);
+          if (shot) db.updateApplication(appId, { evidence_path: shot });
+        } catch (e: any) {
+          console.warn('[/api/apply] 投递后截图失败，不影响已投递：', e?.message || e);
+        }
+        if (jobId) db.updateJob(jobId, { status: 'applied' });
+      } catch { /* 记录失败不阻断主流程 */ }
+    }
+
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || '投递失败' });
+  }
+});
+
+// 投递通道分类：给定岗位投递链接，返回应当走的平台与方式（控制台/批量「自动路由」复用同一判定）
+app.get("/api/apply/classify", (req, res) => {
+  try {
+    const url = typeof req.query.url === 'string' ? req.query.url : '';
+    res.json(classifyDelivery(url));
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || '分类失败' });
+  }
+});
+
+// 批量「auto」模式的路由预览：不投递，只统计候选池各岗位会被分到哪个通道（含会自动走网申的清单）
+app.get("/api/apply/classify-batch", async (req, res) => {
+  try {
+    const source = typeof req.query.source === 'string' ? req.query.source : undefined;
+    const platform = (typeof req.query.platform === 'string' ? req.query.platform : 'auto') as string;
+    const r = await previewBatchRouting({ platform: platform as any, source });
+    res.json(r);
+  } catch (e: any) {
+    if (coreRequiredReplied(e, res)) return;
+    res.status(500).json({ error: e?.message || '路由预览失败' });
+  }
+});
+
+// ============= 会话 API =============
+
+// 获取所有会话（包含消息数量）
+app.get("/api/sessions", (req, res) => {
+  try {
+    const sessions = db.getAllSessions();
+    const sessionsWithMessages = sessions.map(session => {
+      const messages = db.getMessagesBySession(session.id);
+      return {
+        ...session,
+        messageCount: messages.length
+      };
+    });
+    res.json({ sessions: sessionsWithMessages });
+  } catch (error: any) {
+    console.error("[Sessions] Error:", error);
+    res.status(500).json({ error: error?.message || "获取会话失败" });
+  }
+});
+
+// 获取单个会话及其消息
+app.get("/api/sessions/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const session = db.getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: "会话不存在" });
+    }
+    
+    const messages = db.getMessagesBySession(sessionId);
+    
+    // 解析 tool_calls JSON
+    const parsedMessages = messages.map(msg => ({
+      ...msg,
+      tool_calls: msg.tool_calls ? JSON.parse(msg.tool_calls) : null
+    }));
+    
+    res.json({ session, messages: parsedMessages });
+  } catch (error: any) {
+    console.error("[Session] Error:", error);
+    res.status(500).json({ error: error?.message || "获取会话失败" });
+  }
+});
+
+// 创建新会话
+app.post("/api/sessions", (req, res) => {
+  try {
+    const { model = defaultModel, title = "新对话" } = req.body;
+    const now = new Date().toISOString();
+    
+    const session = db.createSession({
+      id: uuidv4(),
+      title,
+      model,
+      sdk_session_id: null,
+      created_at: now,
+      updated_at: now
+    });
+    
+    res.json({ session });
+  } catch (error: any) {
+    console.error("[Create Session] Error:", error);
+    res.status(500).json({ error: error?.message || "创建会话失败" });
+  }
+});
+
+// 更新会话
+app.patch("/api/sessions/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { title, model } = req.body;
+    
+    const success = db.updateSession(sessionId, { title, model });
+    
+    if (!success) {
+      return res.status(404).json({ error: "会话不存在" });
+    }
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("[Update Session] Error:", error);
+    res.status(500).json({ error: error?.message || "更新会话失败" });
+  }
+});
+
+// 删除会话
+app.delete("/api/sessions/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const success = db.deleteSession(sessionId);
+    
+    if (!success) {
+      return res.status(404).json({ error: "会话不存在" });
+    }
+    
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("[Delete Session] Error:", error);
+    res.status(500).json({ error: error?.message || "删除会话失败" });
+  }
+});
+
+// ============= 聊天 API =============
+
+// 权限响应 API
+app.post("/api/permission-response", (req, res) => {
+  const { requestId, behavior, message } = req.body;
+  
+  console.log(`[Permission] Response received: requestId=${requestId}, behavior=${behavior}`);
+  
+  const pending = pendingPermissions.get(requestId);
+  if (!pending) {
+    console.log(`[Permission] Request not found: ${requestId}`);
+    return res.status(404).json({ error: "权限请求不存在或已超时" });
+  }
+  
+  // 清除请求
+  pendingPermissions.delete(requestId);
+  
+  if (behavior === 'allow') {
+    pending.resolve({
+      behavior: 'allow',
+      updatedInput: pending.input
+    });
+  } else {
+    pending.resolve({
+      behavior: 'deny',
+      message: message || '用户拒绝了此操作'
+    });
+  }
+  
+  res.json({ success: true });
+});
+
+// 发送消息并获取流式响应
+app.post("/api/chat", async (req, res) => {
+  const { sessionId, message, model, systemPrompt, cwd, permissionMode } = req.body;
+  
+  // 请求日志
+  console.log(`\n[Chat] ========== 新请求 ==========`);
+  console.log(`[Chat] SessionId: ${sessionId}`);
+  console.log(`[Chat] Model: ${model}`);
+  console.log(`[Chat] Message: ${message?.slice(0, 100)}${message?.length > 100 ? '...' : ''}`);
+  console.log(`[Chat] CWD: ${cwd || 'default'}`);
+
+  if (!message) {
+    console.log(`[Chat] 错误: 消息为空`);
+    return res.status(400).json({ error: "消息不能为空" });
+  }
+
+  // 获取或创建会话
+  let session = sessionId ? db.getSession(sessionId) : null;
+  const now = new Date().toISOString();
+  
+  if (!session) {
+    // 创建新会话
+    console.log(`[Chat] 创建新会话`);
+    session = db.createSession({
+      id: sessionId || uuidv4(),
+      title: message.slice(0, 30) + (message.length > 30 ? '...' : ''),
+      model: model || defaultModel,
+      sdk_session_id: null,  // 稍后从 SDK 获取
+      created_at: now,
+      updated_at: now
+    });
+  } else {
+    console.log(`[Chat] 使用现有会话, SDK Session: ${session.sdk_session_id || 'none'}`);
+  }
+
+  const selectedModel = model || session.model;
+  
+  // 获取 SDK session ID（用于恢复对话）
+  const sdkSessionId = session.sdk_session_id;
+
+  // 创建用户消息 ID 和助手消息 ID
+  const userMessageId = uuidv4();
+  const assistantMessageId = uuidv4();
+
+  // 保存用户消息到数据库
+  try {
+    db.createMessage({
+      id: userMessageId,
+      session_id: session.id,
+      role: 'user',
+      content: message,
+      model: null,
+      created_at: now,
+      tool_calls: null
+    });
+    console.log(`[Chat] 用户消息已保存: ${userMessageId}`);
+  } catch (dbError: any) {
+    console.error(`[Chat] 保存用户消息失败:`, dbError);
+    return res.status(500).json({ error: "保存消息失败", detail: dbError?.message });
+  }
+
+  // 设置 SSE 头
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  // 默认系统提示词：简历自动投递 Agent，附带本机能力地址
+  const defaultSystemPrompt = `${JOB_APPLY_AGENT_PROMPT}\n\n【本机能力地址】所有能力 API 的 baseURL = ${API_BASE}（例如 ${API_BASE}/api/browser/exec）。`;
+  const finalSystemPrompt = systemPrompt
+    ? `${systemPrompt}\n\n【本机能力地址】所有能力 API 的 baseURL = ${API_BASE}。`
+    : defaultSystemPrompt;
+
+  // 工作目录：优先使用请求中的 cwd，否则使用当前目录
+  const workingDir = cwd || process.cwd();
+
+  try {
+    console.log(`[Chat] 调用 SDK query...`);
+    console.log(`[Chat] - Model: ${selectedModel}`);
+    console.log(`[Chat] - Resume: ${sdkSessionId || 'none'}`);
+    console.log(`[Chat] - CWD: ${workingDir}`);
+    console.log(`[Chat] - PermissionMode: ${permissionMode || 'default'}`);
+    
+    // 创建 canUseTool 回调
+    const canUseTool: CanUseTool = async (toolName, input, options) => {
+      console.log(`[Permission] Tool request: ${toolName}`);
+      console.log(`[Permission] Input:`, JSON.stringify(input, null, 2));
+      
+      // bypassPermissions 模式直接放行
+      if (permissionMode === 'bypassPermissions') {
+        console.log(`[Permission] Bypassing permissions for ${toolName}`);
+        return { behavior: 'allow', updatedInput: input };
+      }
+      
+      // 创建权限请求
+      const requestId = uuidv4();
+      const permissionRequest = {
+        requestId,
+        toolUseId: options.toolUseID,
+        toolName,
+        input,
+        sessionId: session.id,
+        timestamp: Date.now()
+      };
+      
+      // 发送权限请求到前端
+      res.write(`data: ${JSON.stringify({ 
+        type: "permission_request", 
+        ...permissionRequest
+      })}\n\n`);
+      
+      // 创建 Promise 等待用户响应
+      return new Promise<PermissionResult>((resolve, reject) => {
+        const pending: PendingPermission = {
+          resolve,
+          reject,
+          toolName,
+          input,
+          sessionId: session.id,
+          timestamp: Date.now()
+        };
+        
+        pendingPermissions.set(requestId, pending);
+        
+        // 设置超时
+        setTimeout(() => {
+          if (pendingPermissions.has(requestId)) {
+            pendingPermissions.delete(requestId);
+            console.log(`[Permission] Request timeout: ${requestId}`);
+            resolve({
+              behavior: 'deny',
+              message: '权限请求超时'
+            });
+          }
+        }, PERMISSION_TIMEOUT);
+      });
+    };
+    
+    // 使用 Query API 发送消息
+    // 如果有 sdk_session_id，使用 resume 恢复对话上下文
+    const stream = query({
+      prompt: message,
+      options: {
+        cwd: workingDir,
+        model: selectedModel,
+        maxTurns: Number(req.body?.maxTurns) || 150,
+        systemPrompt: finalSystemPrompt,
+        permissionMode: permissionMode || 'default',
+        canUseTool,
+        ...(sdkSessionId ? { resume: sdkSessionId } : {})  // 使用 resume 恢复对话
+      }
+    });
+
+    let fullResponse = "";
+    let toolCalls: Array<{ 
+      id: string; 
+      name: string; 
+      input?: Record<string, unknown>;
+      status: string; 
+      result?: string;
+      isError?: boolean;
+    }> = [];
+    let newSdkSessionId: string | null = null;  // 用于存储 SDK 返回的 session_id
+
+    // 发送会话ID和消息ID
+    res.write(`data: ${JSON.stringify({ 
+      type: "init", 
+      sessionId: session.id, 
+      userMessageId, 
+      assistantMessageId,
+      model: selectedModel 
+    })}\n\n`);
+
+    // 当前正在执行的工具 ID（用于匹配 tool_result）
+    let currentToolId: string | null = null;
+
+    // 处理流式响应
+    for await (const msg of stream) {
+      console.log("[Stream] Message type:", msg.type, msg);
+      
+      // 处理 system 消息，获取 SDK 的 session_id
+      if (msg.type === "system" && (msg as any).subtype === "init") {
+        newSdkSessionId = (msg as any).session_id;
+        console.log(`[Stream] Got SDK session_id: ${newSdkSessionId}`);
+        
+        // 保存 SDK session_id 到数据库（如果是新的）
+        if (newSdkSessionId && newSdkSessionId !== sdkSessionId) {
+          db.updateSession(session.id, { sdk_session_id: newSdkSessionId });
+          console.log(`[Stream] Saved SDK session_id to database`);
+        }
+      } else if (msg.type === "assistant") {
+        const content = msg.message.content;
+
+        if (typeof content === "string") {
+          fullResponse += content;
+          res.write(`data: ${JSON.stringify({ type: "text", content })}\n\n`);
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "text") {
+              fullResponse += block.text;
+              res.write(`data: ${JSON.stringify({ type: "text", content: block.text })}\n\n`);
+            } else if (block.type === "tool_use") {
+              currentToolId = block.id || uuidv4();
+              const toolInput = (block as any).input || {};
+              console.log(`[Stream] Tool use: id=${currentToolId}, name=${block.name}`);
+              console.log(`[Stream] Tool input:`, JSON.stringify(toolInput, null, 2));
+              
+              const toolCall = { 
+                id: currentToolId, 
+                name: block.name, 
+                input: toolInput,
+                status: "running" 
+              };
+              toolCalls.push(toolCall);
+              res.write(`data: ${JSON.stringify({ 
+                type: "tool", 
+                id: toolCall.id,
+                name: toolCall.name,
+                input: toolCall.input,
+                status: toolCall.status
+              })}\n\n`);
+            }
+          }
+        }
+      } else if ((msg as any).type === "tool_result") {
+        // 处理工具结果（独立的消息类型）
+        const msgAny = msg as any;
+        const toolId = msgAny.tool_use_id || currentToolId;
+        const isError = msgAny.is_error || false;
+        const content = msgAny.content;
+        
+        console.log(`[Stream] Tool result: tool_use_id=${toolId}, is_error=${isError}`);
+        console.log(`[Stream] Tool result content type:`, typeof content);
+        console.log(`[Stream] Tool result content:`, typeof content === 'string' ? content.slice(0, 500) : JSON.stringify(content, null, 2)?.slice(0, 500));
+        
+        const tool = toolCalls.find(t => t.id === toolId) || toolCalls[toolCalls.length - 1];
+        if (tool) {
+          tool.status = isError ? "error" : "completed";
+          tool.isError = isError;
+          tool.result = typeof content === 'string' 
+            ? content 
+            : JSON.stringify(content);
+          res.write(`data: ${JSON.stringify({ 
+            type: "tool_result", 
+            toolId: tool.id, 
+            content: tool.result,
+            isError: isError
+          })}\n\n`);
+        }
+        currentToolId = null;
+      } else if (msg.type === "result") {
+        // 完成时确保所有工具都标记为完成
+        toolCalls.forEach(tool => {
+          if (tool.status === "running") {
+            tool.status = "completed";
+            res.write(`data: ${JSON.stringify({ type: "tool_result", toolId: tool.id, content: tool.result || "已完成" })}\n\n`);
+          }
+        });
+        res.write(`data: ${JSON.stringify({ type: "done", duration: (msg as any).duration_ms, cost: (msg as any).total_cost_usd })}\n\n`);
+      }
+    }
+
+    // 保存助手消息到数据库
+    db.createMessage({
+      id: assistantMessageId,
+      session_id: session.id,
+      role: 'assistant',
+      content: fullResponse,
+      model: selectedModel,
+      created_at: new Date().toISOString(),
+      tool_calls: toolCalls.length > 0 ? JSON.stringify(toolCalls) : null
+    });
+
+    // 更新会话标题（如果是第一条消息）
+    const messages = db.getMessagesBySession(session.id);
+    if (messages.length <= 2) {
+      db.updateSession(session.id, { 
+        title: message.slice(0, 30) + (message.length > 30 ? '...' : ''),
+        model: selectedModel
+      });
+    }
+
+    console.log(`[Chat] 请求完成 ✓`);
+    res.end();
+  } catch (error: any) {
+    console.error(`\n[Chat] ========== 错误 ==========`);
+    console.error(`[Chat] Error Name:`, error?.name);
+    console.error(`[Chat] Error Message:`, error?.message);
+    console.error(`[Chat] Error Code:`, error?.code);
+    console.error(`[Chat] Error Stack:`, error?.stack);
+    console.error(`[Chat] Full Error:`, JSON.stringify(error, null, 2));
+    
+    const errorMessage = error?.message || "处理请求时发生错误";
+    res.write(`data: ${JSON.stringify({ type: "error", message: errorMessage })}\n\n`);
+    res.end();
+  }
+});
+
+// Express 终末错误中间件：未捕获的路由异常统一返回 500 JSON 并落日志，避免连接悬挂
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // 🔴 核心版专属路由在基础版里被访问：桩抛 CORE_UNAVAILABLE。
+  //    这**不是服务端故障**，所以 ① 不落 ERROR、不触发告警 ② 回 501 + 明确文案。
+  //    刻意不伪装成 404：让「这一屏需要完整版」对用户和调用方都可见（可见 > 假装不存在）。
+  if (isCoreUnavailable(err)) {
+    if ((res as any).__errLogged !== true) (res as any).__errLogged = true; // 别再被 finish 兜底记一条
+    if (res.headersSent) return next(err);
+    return res.status(501).json({ error: CORE_REQUIRED_MESSAGE, code: 'CORE_REQUIRED' });
+  }
+  const code = Number(err?.status || err?.statusCode) || 500;
+  // 只有真正的服务端故障（5xx）才落 ERROR + 触发告警；4xx 参数错误属客户端问题，不打扰
+  if (code >= 500) {
+    (res as any).__errLogged = true; // 已记录，避免 finish 兜底重复记一条
+    logRun('ERROR', `express error: ${err?.stack || err}`);
+  }
+  if (res.headersSent) return next(err);
+  if (code >= 400 && code < 500) return res.status(code).json({ error: String(err?.message || '请求错误') });
+  res.status(500).json({ error: '服务器内部错误' });
+});
+
+// 启动服务器
+const server = app.listen(PORT, HOST, () => {
+  // 真实冷启动耗时：从「进程创建」算起（含 tsx 转译 + ESM 依赖加载），比模块体内的计时准确
+  logRun('INFO', `API 服务器已启动 http://${HOST}:${PORT}｜数据库 SQLite(data/chat.db)｜冷启动 ${Math.round(process.uptime() * 1000)}ms`);
+  console.log(`
+╔════════════════════════════════════════════╗
+║                                            ║
+║     ◉ 简历投递 Agent · API 服务器已启动     ║
+║                                            ║
+║     地址: http://${HOST}:${PORT}            ║
+║     数据库: SQLite (data/chat.db)          ║
+║     能力: 浏览器自动化 / 邮箱验证码 / 档案  ║
+║                                            ║
+╚════════════════════════════════════════════╝
+  `);
+  // 局域网 / 手机访问：把可访问地址显式打出来（不塞进上面的定宽方框，避免长短不一把框撑歪）。
+  // 双端互通：手机与桌面连同一后端、同一 SQLite，改的是一份数据。
+  if (LAN_EXPOSED) {
+    const urls = LAN_URLS.length ? LAN_URLS : [];
+    logRun('INFO', `已暴露到局域网（HOST=${HOST}）：${urls.join(' ') || '未检测到网卡地址'}｜令牌鉴权已开启`);
+    console.log('[局域网] 手机 / 平板访问地址（需与本机连同一 Wi-Fi）：');
+    console.log(urls.length ? urls.map((u) => `         ${u}`).join('\n') : '         (未检测到局域网网卡地址，请检查网络连接)');
+    console.log('[局域网] 注意：同网段设备都能打开控制台并触发真实投递，请仅在可信网络下使用。');
+  }
+  /**
+   * 常驻监视器（自动回复 / 后台连投）**不再随启动自动武装** —— 2026-10-11 安全修补。
+   *
+   * 🔴 为什么必须解耦（这是本轮审计里最危险的一处）：
+   *   `auto_reply_watch.json` 出厂即 `enabled:true, realSend:true, intervalSec:700`，
+   *   而这两句写在 `app.listen` 回调里 ⇒ **只要启动后端**（哪怕只是跑一次测试、跑一次审计、
+   *   或者只是想看看控制台），约 **11.7 分钟后就会真给 HR 发消息**、
+   *   **15 分钟后就会真投递**（`auto_apply_watch.json` intervalSec=900）—— 两者**都不可撤回**。
+   *   「起一个服务」不该等价于「授权对外发消息」，这两件事必须分开成两个显式意图。
+   *
+   * 判据 = **必须同时**满足：
+   *   ① 环境变量 `OW_AUTO_BOOTSTRAP=1`（由 `start_server.bat` 设置，即用户"双击启动"这条路径），且
+   *   ② 配置里 `enabled:true`（`bootstrap*` 内部自己判断）。
+   *
+   * 🔴 为什么用**环境变量**而不是配置字段：配置**区分不了"谁在启动"** ——
+   *   测试与审计脚本 spawn 的是同一个入口、读的是同一份配置、同一份 data/。
+   *   只有"启动上下文"能区分「用户双击启动」与「我起个服务跑一下」。
+   *
+   * 跳过时**必须大声说一句**：否则用户会以为监视器坏了（静默不做事的守卫＝最难查的 bug）。
+   * 接线由合约测试钉住（环境变量名两处必须一致，见 contract_tests 的 H 节）。
+   */
+  const AUTO_BOOTSTRAP = process.env.OW_AUTO_BOOTSTRAP === '1';
+  if (AUTO_BOOTSTRAP) {
+    try {
+      bootstrapWatcher();
+      bootstrapApplyWatch();
+    } catch (e) {
+      console.error('[watch] bootstrap failed:', e);
+    }
+  } else {
+    logRun('INFO', '常驻监视器未自动启动（需 OW_AUTO_BOOTSTRAP=1）；可在控制台手动开启');
+    console.log('[watch] 常驻监视器**未**自动启动 —— 这是刻意的，不是故障：');
+    console.log('        自动武装会在启动后约 11.7 分钟真给 HR 发消息、15 分钟真投递，且不可撤回。');
+    console.log('        需要自动跟进/自动投递：用 start_server.bat（或 start_all.bat / start_lan.bat）启动，');
+    console.log('        或在控制台「自动回复」「后台连投」面板里手动开启。');
+  }
+  // 非阻塞：释放过期磁盘占用（截图超期、DB 备份仅留最近若干份 / 简历备份 / 运行日志），
+  // 并在 data/ 总体积超阈值时**自动限额**（档位见 services/dataCleanup.ts 的 AutoLimitMode）：
+  //   默认 safe —— 只收紧保留期（截图 14→7/3 天、日志 30→14/7 天、备份份数下调），
+  //   删的都是"本来就该过期"的东西；`full` 才会额外清调试产物与过期 JD 图。
+  //   `DATA_AUTO_LIMIT=off` 可退回"只告警"的旧行为。
+  //   🔴 browser 登录态 / evidence 投递证据 / resume_tailored 一岗一简历产物 **任何档位都不碰**。
+  cleanupData({})
+    .then((rep: any) => {
+      const al = rep?.autoLimit;
+      if (al?.triggered) {
+        logRun('INFO', `data/ 超阈值已自动限额(${al.mode})：本次释放 ${rep.freedHuman}`
+          + (al.stillOver ? '，清理后仍超阈值（体积大头是不自动清理的登录态/证据，需人工处置或调高 DATA_MAX_MB）' : ''));
+      }
+      if (rep && rep.overThreshold) {
+        logRun('ERROR', `data/ 已达 ${rep.totalHuman}，超过阈值 ${Math.round((rep.maxBytes || 0) / 1024 / 1024)}MB —— ${al?.stillOver ? '自动清理后仍超，需人工处置' : '建议清理'}（npm run data:cleanup；或用 DATA_MAX_MB 调整阈值）`);
+      }
+    })
+    .catch((e) => logRun('ERROR', `cleanupData 启动清理异常: ${e}`));
+});
+
+// 启动期错误（典型：端口被占用）——必须显式处理，否则落到 uncaughtException，
+// 用户只能在日志/告警里看到一句 EADDRINUSE 栈，不知道「已有实例在跑」。
+server.on('error', (err: any) => {
+  try {
+    if (err?.code === 'EADDRINUSE') {
+      logRun('ERROR', `端口 ${PORT} 已被占用：请先关闭正在运行的实例，或设置 PORT 换端口`);
+      try {
+        console.error(`\n[启动失败] 端口 ${PORT} 已被占用。请先关闭已运行的实例，或用 PORT=4401 换端口后重试。\n`);
+      } catch { /* stdout 管道可能已断开，忽略 */ }
+      process.exit(1);
+    }
+    logRun('ERROR', `listen error: ${err?.stack || err}`);
+    try { console.error(`[启动失败] ${err?.message || err}`); } catch { /* ignore */ }
+    process.exit(1);
+  } catch {
+    process.exit(1);
+  }
+});
+
+// 退出时关闭所有浏览器，避免残留进程
+const shutdown = async () => {
+  try {
+    await closeAll();
+  } catch {
+    /* 忽略 */
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+};
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+// 全局异常兜底：不因单个未捕获异常而静默退出（否则用户端表现为「控制台突然打不开、投递莫名中断」）
+// ⚠️ 2026-09-21 修复「日志自我放大」：实测单日写出 330 万行 / 240MB，内容全是
+//    `uncaughtException: Error: EPIPE: broken pipe, write`。链路是：
+//      stdout 管道断开（启动它的终端/父进程被关）→ console.* 抛 EPIPE → uncaughtException →
+//      logRun 又去 console.error → 又 EPIPE → 再 uncaughtException …… 无限循环 + 同步 append 狂写盘。
+//    因此：管道类噪声错误**绝不落日志、绝不告警**（它们不是应用故障，且写日志本身会再触发它）。
+process.on('uncaughtException', (err) => {
+  if (isPipeNoise(err)) return; // 静默丢弃，打破自激循环
+  // 基础版里核心模块是桩：任何「浮动 Promise 碰到桩」都会变成一次 unhandledRejection。
+  // 这是**预期状态**而非故障，记 ERROR 只会把内部路径写进日志、并在故障排查时误导。
+  if (isCoreUnavailable(err)) return;
+  logRun('ERROR', `uncaughtException: ${(err as any)?.stack || err}`);
+});
+process.on('unhandledRejection', (reason) => {
+  if (isPipeNoise(reason)) return;
+  if (isCoreUnavailable(reason)) return; // 同上：基础版预期状态
+  const r: any = reason;
+  logRun('ERROR', `unhandledRejection: ${r?.stack || r}`);
+});

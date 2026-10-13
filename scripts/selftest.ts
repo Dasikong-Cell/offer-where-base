@@ -1,0 +1,259 @@
+/**
+ * 软件回归自检（只读：不发信、不投递、不改档案）
+ * ==========================================================================
+ * 覆盖核心纯函数的正确性与边界：简历解析 / 匹配引擎 / 邮箱抽取 / 域名归约 / 一岗一简历。
+ * 用于「改动后快速确认没坏」以及「交付前测评」。
+ *
+ * 运行：./node/node.exe node_modules/tsx/dist/cli.mjs scripts/selftest.ts
+ */
+import '../server/env.js';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { parseResumeFile, structureResume } from '../server/services/resume.js';
+// 🔴 匹配引擎 / 邮箱扫描 / AI 定制简历 / LLM 客户端都属**核心版**（自动化 + AI）。
+//    基础版发行包里它们是「调用即抛 CORE_UNAVAILABLE」的桩 ⇒ 下面 B / C / D 三段
+//    必须**整段跳过并如实计数**，否则基础版一跑自检就崩（2026-10-12 于公开树实测）。
+import { matchResumeToJob } from '../server/services/match.js';
+import { extractEmails, rootDomain } from '../server/services/offerbiuEmailScan.js';
+import { tailorResume } from '../server/services/apply/resumeTailor.js';
+// parseSkills / buildResumeBlob 是**纯字段解析**，已抽到基础侧 resumeBlob.ts：
+// 它们与 LLM 无关，基础版也要能用，从核心模块取会平白多一条「基础依赖核心」的边。
+import { parseSkills, buildResumeBlob } from '../server/services/resumeBlob.js';
+import { isAiEnabled } from '../server/services/apply/aiClient.js';
+import { isCoreUnavailable, coreOr } from '../server/coreBridge.js';
+import { buildResumeHtml } from '../server/services/apply/resumeRender.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(__dirname, '..');
+
+let pass = 0, fail = 0, skip = 0;
+// 被跳过的断言必须**如实**计入汇总行 —— 否则「共 N」看着是全绿，实际有断言压根没跑。
+// 每条跳过都带原因，汇总行会把原因逐条列出来（与 contract_tests.ts 的 skipReasons 同一套做法）。
+const skipReasons: string[] = [];
+function skipCheck(n: number, reason: string) {
+  skip += n;
+  skipReasons.push(n === 1 ? reason : `${reason} × ${n}`);
+}
+const results: Array<{ name: string; ok: boolean; detail: string }> = [];
+
+/**
+ * 核心能力（自动化 + AI）是否随本发行包发布？探测一次并缓存。
+ *
+ * 🔴 为什么不能靠「try 一下再说」：桩模块**能被 import**，只有**调用**导出时才抛错
+ *    （见 coreBridge.ts 文件头）。所以这里调一次最轻的核心函数（纯内存数组）即可判定；
+ *    判据只认 `err.code === 'CORE_UNAVAILABLE'`，不按 message 匹配（message 里带文件路径）。
+ */
+let CORE_SHIPPED: boolean | null = null;
+function coreShipped(): boolean {
+  if (CORE_SHIPPED !== null) return CORE_SHIPPED;
+  try {
+    matchResumeToJob('x', [], 'y');
+    CORE_SHIPPED = true;
+  } catch (err) {
+    if (!isCoreUnavailable(err)) throw err;
+    CORE_SHIPPED = false;
+  }
+  return CORE_SHIPPED;
+}
+const CORE_SKIP_REASON = '核心版（自动化 + AI）未随此发行包发布';
+
+function check(name: string, ok: boolean, detail = '') {
+  results.push({ name, ok, detail });
+  ok ? pass++ : fail++;
+  console.log(`${ok ? '✅' : '❌'} ${name}${detail ? '  — ' + detail : ''}`);
+}
+
+// ─────────────────────────────────────────────────────────
+console.log('\n══════ A. 简历解析 ══════');
+const resumePath = path.join(ROOT, 'data', 'resume_source.pdf');
+let struct: any = null;
+// 🔴 断言清单集中成数组，**跳过时按 `resumeChecks.length` 计数，不写死数字**。
+// 写死的代价实测过：原本是 `skip += 6`，而汇总行又在别处漏算了一条 ⇒
+// CI 报「跳过 6 项」而实际 7 条没跑（2026-09-28 由「本地 58 / CI 51+6」的差额查出）。
+const resumeChecks = [
+  () => check('PDF 可解析', struct.rawText.length > 200, `${struct.rawText.length} 字符`),
+  () => check('抽取到姓名', !!struct.name, struct.name || '(空)'),
+  () => check('抽取到手机号', /^1\d{10}$/.test(String(struct.phone || '')), struct.phone || '(空)'),
+  () => check('抽取到邮箱', /@/.test(String(struct.email || '')), struct.email || '(空)'),
+  () => check('抽取到技能', struct.skills.length >= 5, `${struct.skills.length} 项`),
+  () => check('searchBlob 非空', Boolean(struct.searchBlob && struct.searchBlob.length > 50), `${(struct.searchBlob || '').length} 字符`),
+];
+if (!fs.existsSync(resumePath)) {
+  // data/ 属个人数据、不入库；CI / 新机器上缺失属正常，跳过而非误报失败。
+  console.log(`⏭️  跳过 A（未找到 ${path.relative(ROOT, resumePath)} —— 个人数据不入库，CI/新机器上正常缺失）`);
+  skipCheck(resumeChecks.length, `无 ${path.relative(ROOT, resumePath)}（个人数据不入库，CI/新机器上正常缺失）`);
+} else {
+  try {
+    struct = await parseResumeFile(resumePath);
+    for (const f of resumeChecks) f();
+  } catch (e: any) {
+    check('简历解析整体', false, e?.message || String(e));
+  }
+}
+
+console.log('\n══════ A2. 手机号抽取（多种常见写法） ══════');
+const phoneCases: Array<[string, string]> = [
+  ['电话：139-1234-5678', '13912345678'],   // 分段（本次修复）
+  ['手机 138 0013 8000', '13800138000'],     // 空格分段
+  ['联系方式：15912345678', '15912345678'],  // 连续
+  ['+86 187 0000 0001', '18700000001'],      // 带国际区号
+  ['邮箱 a@b.com 无手机', ''],               // 无手机号
+];
+for (const [input, expect] of phoneCases) {
+  const got = structureResume(`张三\n${input}\n技能：Java`).phone || '';
+  check(`手机号「${input}」`, got === expect, `→ ${got || '(空)'}${expect ? ' 期望 ' + expect : ''}`);
+}
+
+// ─────────────────────────────────────────────────────────
+console.log('\n══════ B. 匹配引擎（纯本地规则，可复现） ══════');
+// ⚠️ 这两个常量必须定义在 coreMatchChecks **之前**：thunk 体内引用它们，
+//    而数组会在下面被立即执行（const 的 TDZ 不会因为「写在函数里」就豁免）。
+const SKILLS_FIX = ['Java', 'Spring Boot', 'MySQL', 'Redis'];
+const RESUME_BLOB = '张三 软件工程 本科 Java Spring Boot MySQL Redis Docker';
+
+/** B 段断言清单（跳过时按 `length` 计数，不写死数字 —— 见 A 段 resumeChecks 的注释） */
+const coreMatchChecks: Array<() => void> = [
+  () => { const t = matchResumeToJob(RESUME_BLOB, SKILLS_FIX, '招聘Java开发，要求熟悉Java、Spring Boot、MySQL、Redis，有Docker经验优先');
+    check('高相关 JD → 高分', t.score >= 60, `score=${t.score} matched=${t.matched.length} missing=${t.missing.length}`); },
+  () => { const t = matchResumeToJob(RESUME_BLOB, SKILLS_FIX, '招聘平面设计师，要求熟练 Photoshop、Illustrator，负责品牌视觉设计');
+    check('低相关 JD → 低分', t.score < 40, `score=${t.score}`); },
+  () => { const a = matchResumeToJob(RESUME_BLOB, SKILLS_FIX, 'Java开发工程师');
+    const b = matchResumeToJob(RESUME_BLOB, SKILLS_FIX, 'Java开发工程师');
+    check('同输入结果可复现', a.score === b.score, `${a.score} vs ${b.score}`); },
+  () => { // ⚠️ 2026-09-19 契约变更：无 JD 时**不再**用职位名兜底打分（否则按匹配度排序投递会退化成随机排序）。
+    // ⚠️ 2026-10-12 二次变更：无 JD 时 score 由「恒为 0」改为 **null**（0 是「评估过、确实不像」的
+    //    有效分，与「没得评」混用会让匹配度指标整体失真）。出处见
+    //    `docs/MATCH_SCORE_SEMANTICS_2026-10-12.md`，口径：可评估 ⇔ (jd+requirements) 去空白后 ≥ 10 字。
+    const t = matchResumeToJob(RESUME_BLOB, SKILLS_FIX, '', undefined, 'Java开发工程师');
+    check('无 JD 时不再兜底打分（应得 null 而非 0）', t.score === null && t.basis === 'none', `score=${t.score} basis=${t.basis}`); },
+  () => { const t = matchResumeToJob(RESUME_BLOB, SKILLS_FIX, '', undefined, 'Java开发工程师');
+    check('无 JD 时明确提示不可参与排序', t.suggestions.some((s) => /(JD|排序)/.test(s)), t.suggestions[0]?.slice(0, 40) || ''); },
+  () => { const t = matchResumeToJob('', [], '');
+    check('全空输入不崩溃（无 JD ⇒ null，非 0）', t.score === null, `score=${t.score}`); },
+];
+if (!coreShipped()) {
+  console.log(`⏭️  跳过 B（${CORE_SKIP_REASON}：AI 语义匹配引擎）`);
+  skipCheck(coreMatchChecks.length, `${CORE_SKIP_REASON}：匹配引擎`);
+} else {
+  for (const f of coreMatchChecks) f();
+}
+
+// ─────────────────────────────────────────────────────────
+console.log('\n══════ C. 招聘邮箱抽取（offerbiu 扫描核心） ══════');
+const mailCases: Array<[string, string, boolean]> = [
+  ['招聘邮箱：hr@company.com.cn', 'hr@company.com.cn', true],
+  ['投递至 zhaopin@abc.cn / campus@abc.cn', 'zhaopin@abc.cn', true],
+  ['noreply@example.com', '(应被过滤)', false],
+  ['备案号 京ICP备123号 w3.org', '(无邮箱)', false],
+];
+const domCases: Array<[string, string]> = [
+  ['https://www.zhipin.com/job_detail/x.html', 'zhipin.com'],
+  ['https://campus.abc.com.cn/apply', 'abc.com.cn'],
+  ['https://hr.abc.co.uk/job', 'abc.co.uk'],
+  ['not-a-url', ''],
+];
+
+// 断言清单由**用例数组 map 出来**（不是写死的 thunk 列表）：
+// 这样「跳过时计入几条」＝用例数组长度，谁往用例表里加一行，跳过计数会自动跟上。
+const coreMailChecks: Array<() => void> = [
+  ...mailCases.map(([input, expect, shouldFind]) => () => {
+    const got = extractEmails(input);
+    const ok = shouldFind ? got.includes(expect) : got.length === 0;
+    check(`抽取「${input.slice(0, 22)}…」`, ok, got.join(',') || '(空)');
+  }),
+  ...domCases.map(([input, expect]) => () => {
+    check(`注册域归约 ${input}`, rootDomain(input) === expect, `→ ${rootDomain(input) || '(空)'}`);
+  }),
+];
+if (!coreShipped()) {
+  console.log(`⏭️  跳过 C（${CORE_SKIP_REASON}：招聘邮箱扫描）`);
+  skipCheck(coreMailChecks.length, `${CORE_SKIP_REASON}：招聘邮箱扫描`);
+} else {
+  for (const f of coreMailChecks) f();
+}
+
+// ─────────────────────────────────────────────────────────
+console.log('\n══════ D. 一岗一简历 ══════');
+const profile = { name: '测试', school: 'X大学', major: '软件工程', education: '本科', skills: 'Java,Spring Boot,MySQL,Redis,Docker' };
+check('parseSkills 解析分隔符', parseSkills(profile).length === 5, parseSkills(profile).join('|'));
+check('buildResumeBlob 非空', buildResumeBlob(profile).length > 10, `${buildResumeBlob(profile).length} 字符`);
+/**
+ * D 段「AI 定制」部分的断言清单 —— **跳过时按本数组 `length` 计数，不写死数字**。
+ * 含「源为 llm 才跑」的防幻觉那条：真跑时若 LLM 未生效，下面另有 `skipCheck(1)` 补记，
+ * 两条路径的合计都是 4。
+ */
+const coreTailorCheckNames = [
+  '定制产出 core 字段',
+  '技能按 JD 相关度重排',
+  'Markdown 含关键小节',
+  '防幻觉：未凭空新增技能',
+];
+if (!coreShipped()) {
+  console.log(`  ⏭️  跳过 D 的 AI 定制部分（${CORE_SKIP_REASON}）`);
+  skipCheck(coreTailorCheckNames.length, `${CORE_SKIP_REASON}：一岗一简历（AI 定制）`);
+} else {
+  // AI 是否配置属「环境事实」而非「代码正确性」，故只提示、不判失败（换台没配 LLM 的机器也能跑通自检）
+  // 🔴 `coreOr` 兜底：isAiEnabled 属核心模块，基础版里调用即抛 —— 但这一行在 coreShipped() 为假时
+  //    根本不会执行，保留 coreOr 是为了「这一段将来被挪到门控之外」时不至于炸。
+  const aiOn = coreOr(() => isAiEnabled(), false);
+  console.log(`  ${aiOn ? 'ℹ️' : '⏭️'}  AI 配置：${aiOn ? '已启用' : '未配置（将走本地规则回退）'}`);
+
+  const tailored = await tailorResume(profile as any, {
+    position: 'Java开发工程师', company: '测试公司',
+    jd: '任职要求：熟悉 Java、Spring Boot、MySQL、Redis、Docker，有微服务经验优先，负责后端接口开发与性能优化。',
+  });
+  check('定制产出 core 字段', Boolean(tailored.summary && tailored.markdown), `source=${tailored.source} score=${tailored.matchScore}`);
+  check('技能按 JD 相关度重排', tailored.orderedSkills[0] && /java/i.test(tailored.orderedSkills[0]), tailored.orderedSkills.slice(0, 4).join(','));
+  check('Markdown 含关键小节', /核心优势/.test(tailored.markdown) && /匹配/.test(tailored.markdown), `${tailored.markdown.length} 字符`);
+  if (tailored.source === 'llm') {
+    const known = new Set(parseSkills(profile).map((s) => s.toLowerCase()));
+    const invented = tailored.orderedSkills.filter((s) => !known.has(s.toLowerCase()));
+    check('防幻觉：未凭空新增技能', invented.length === 0, invented.join(',') || '(无)');
+  } else {
+    console.log('  ⏭️  LLM 未生效，跳过防幻觉校验（回退本地规则）');
+    // 这里原本只打印、不计入 skip ⇒ 汇总行少报一条。凡是「本该跑但没跑」的断言都要计数。
+    skipCheck(1, 'LLM 未生效（回退本地规则）⇒ 不做防幻觉校验');
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// E / F 两组（岗位字段清洗 / 卡片尾巴清洗）已于 2026-10-01 **迁移**到
+// `tests/unit/sanitize.test.ts` —— 它们是纯字符串变换，与 DB / 文件无关，
+// 放在标准 test runner 里能单跑一个文件、每条脏值独立命名、失败能精确定位。
+// 顺带让本文件不再 import `server/db.js`（那会打开 data/chat.db 并跑 migration）。
+
+// ─────────────────────────────────────────────────────────
+console.log('\n══════ G. 定制简历 HTML 渲染（一岗一简历出稿） ══════');
+const html = buildResumeHtml({
+  profile: { name: '张三', phone: '13000000000', email: 'a@b.com', city: '昆明' },
+  struct: {
+    rawText: '张三\n电话：13000000000\n求职意向\nJava开发工程师\n教育经历\n云南大学｜软件工程\n2020.09 — 2024.06\n• 主修数据结构、计算机网络\n专业技能\nJava、MySQL\n项目经历\n• 电商后台系统（Spring Boot）\n• 数据看板（Vue3）',
+    name: '张三', phone: '13000000000', email: 'a@b.com',
+  },
+  tailored: {
+    company: '测试公司', position: 'Java开发工程师',
+    summary: '软件工程本科，具备 Java 后端开发能力。',
+    highlights: ['熟练掌握 Java 与 Spring Boot'],
+    orderedSkills: ['Java', 'Spring Boot', 'MySQL', 'Redis', 'Docker'],
+  },
+});
+check('HTML 含姓名与应聘岗位', html.includes('张三') && html.includes('Java开发工程师'), `${html.length} 字符`);
+check('HTML 含定制核心优势', html.includes('核心优势') && html.includes('软件工程本科'), '');
+check('HTML 含重排后的技能', html.includes('Docker') && html.includes('class="tag"'), '');
+check('HTML 保留原文经历（信息零丢失）', html.includes('项目经历') && html.includes('电商后台系统'), '');
+// ⚠️ 关键：发给 HR 的简历里**不得**出现内部匹配分析
+check('HTML 不泄露内部匹配信息', !/匹配度|matchScore|待补/.test(html), '');
+const skillOccur = (html.match(/专业技能/g) || []).length;
+check('专业技能只出现一次（未与原文重复）', skillOccur === 1, `出现 ${skillOccur} 次`);
+check('HTML 自包含（无外链资源）', !/<(link|script|img)\b/i.test(html), '');
+
+// ─────────────────────────────────────────────────────────
+console.log('\n══════ 汇总 ══════');
+console.log(`通过 ${pass} / 共 ${pass + fail}${skip ? `（跳过 ${skip} 项：${skipReasons.join('；')} —— 这些断言本次未执行，不在分母内）` : ''}${fail ? `，失败 ${fail}` : ''}`);
+if (fail) {
+  console.log('\n失败明细：');
+  for (const r of results.filter((x) => !x.ok)) console.log(`  ❌ ${r.name}  ${r.detail}`);
+}
+console.log(fail ? '\n❌ 自检未全部通过' : '\n✅ 全部通过');
+process.exit(fail ? 1 : 0);

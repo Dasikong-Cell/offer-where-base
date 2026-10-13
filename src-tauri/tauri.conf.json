@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OfferWhere",
+  "version": "1.0.0",
+  "identifier": "com.offerwhere.desktop",
+  "build": {
+    "frontendDist": "../public",
+    "devUrl": "http://127.0.0.1:4400"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "resources": []
+  }
+}
